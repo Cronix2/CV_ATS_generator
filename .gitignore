@@ -33,6 +33,10 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# debug files 
-/debug
+# debug files — contain personal data scraped from LinkedIn profiles.
+# Everything inside /debug is ignored EXCEPT .gitkeep and README.md so the
+# folder exists in the repo (the scraper needs it) without leaking any PII.
+/debug/*
+!/debug/.gitkeep
+!/debug/README.md
 
