@@ -1,0 +1,234 @@
+"""Optional LLM enhancement: specialised sub-agents orchestrated with LangChain.
+
+Every sub-agent is a `prompt | llm.with_structured_output(Schema)` chain. The
+orchestrator runs the selected ones in parallel (RunnableParallel) and isolates
+failures per agent. Agents only return *suggestions*: the UI lets the user
+accept or reject each one, nothing is applied silently.
+Works with any OpenAI-compatible API (OpenAI, Mistral, Groq, OpenRouter, Ollama…).
+"""
+
+import json
+import re
+from typing import Any
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableLambda, RunnableParallel
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+
+from app.models import CV, Profile
+
+
+class LLMConfig(BaseModel):
+    api_key: str
+    base_url: str = ""
+    model: str = "gpt-4o-mini"
+
+
+# --------------------------------------------------------------------------- output schemas
+
+class SummaryOut(BaseModel):
+    headline: str = Field(description="Titre professionnel court et ciblé (max 80 caractères)")
+    summary: str = Field(description="Résumé professionnel de 3 à 5 phrases, riche en mots-clés")
+
+
+class ExperienceRewrite(BaseModel):
+    id: str
+    description: str = Field(description="Puces commençant par '- ', verbes d'action, résultats chiffrés si présents dans la source")
+
+
+class ExperienceOut(BaseModel):
+    items: list[ExperienceRewrite]
+
+
+class SkillsOut(BaseModel):
+    skills: list[str] = Field(description="Compétences dédupliquées, noms standards, triées par pertinence")
+    missing_keywords: list[str] = Field(description="Mots-clés de l'offre absents du profil (à n'ajouter que si vrais)")
+
+
+class ExperienceFix(BaseModel):
+    id: str
+    title: str
+    company: str
+    location: str
+    employment_type: str
+
+
+class EducationFix(BaseModel):
+    id: str
+    school: str
+    degree: str
+    field: str
+
+
+class CleanupOut(BaseModel):
+    experience: list[ExperienceFix]
+    education: list[EducationFix]
+
+
+class ATSReviewOut(BaseModel):
+    score: int = Field(description="Score de compatibilité ATS de 0 à 100")
+    strengths: list[str]
+    improvements: list[str]
+    missing_keywords: list[str]
+
+
+# --------------------------------------------------------------------------- agents
+
+COMMON = (
+    "Tu es un expert en recrutement et en optimisation de CV pour les ATS (Applicant Tracking Systems). "
+    "N'invente JAMAIS d'expérience, de diplôme, de chiffre ou de compétence absents des données fournies. "
+    "Rédige en {language}. Réponds uniquement avec un objet JSON conforme à ce schéma :\n{schema}"
+)
+
+AGENTS: dict[str, dict[str, Any]] = {
+    "summary": {
+        "schema": SummaryOut,
+        "system": "Tu rédiges le titre et le résumé professionnel en tête de CV.",
+        "user": "Profil :\n{profile}\n\nOffre visée (peut être vide) :\n{job}",
+    },
+    "experience": {
+        "schema": ExperienceOut,
+        "system": (
+            "Tu réécris la description de chaque expérience en 3 à 6 puces percutantes : verbe d'action au début, "
+            "impact et résultats, mots-clés du métier et de l'offre. Garde le même `id` pour chaque expérience."
+        ),
+        "user": "Expériences :\n{experience}\n\nOffre visée (peut être vide) :\n{job}",
+    },
+    "skills": {
+        "schema": SkillsOut,
+        "system": (
+            "Tu normalises la liste de compétences : dédoublonne, utilise les noms standards reconnus par les ATS "
+            "(ex. 'JS' -> 'JavaScript'), trie par pertinence pour l'offre, et liste les mots-clés de l'offre absents."
+        ),
+        "user": "Compétences actuelles :\n{skills}\n\nCompétences citées dans les expériences :\n{exp_skills}\n\nOffre visée (peut être vide) :\n{job}",
+    },
+    "cleanup": {
+        "schema": CleanupOut,
+        "system": (
+            "Les données viennent d'un scraping LinkedIn heuristique : des champs peuvent être inversés ou mal découpés "
+            "(intitulé/entreprise, lieu, type de contrat, diplôme/domaine). Corrige-les sans rien inventer ; "
+            "laisse un champ vide s'il est inconnu. Garde les mêmes `id`."
+        ),
+        "user": "Expériences :\n{experience_raw}\n\nFormations :\n{education}",
+    },
+    "ats_review": {
+        "schema": ATSReviewOut,
+        "system": (
+            "Tu audites le CV comme le ferait un ATS puis un recruteur : couverture des mots-clés de l'offre, "
+            "clarté des intitulés, résultats mesurables, sections attendues. Donne des améliorations concrètes."
+        ),
+        "user": "CV :\n{profile}\n\nOffre visée (peut être vide) :\n{job}",
+    },
+}
+
+
+def normalize_base_url(url: str) -> str | None:
+    """The client appends /chat/completions itself: accept a pasted full endpoint too."""
+    url = url.strip().rstrip("/")
+    for suffix in ("/chat/completions", "/completions"):
+        url = url.removesuffix(suffix)
+    return url or None
+
+
+def explain_error(e: Exception) -> str:
+    status = getattr(e, "status_code", None)
+    if status in (404, 405):
+        return (f"{e} — l'URL de l'API ne pointe pas vers une API compatible OpenAI. "
+                "Indiquez l'adresse qui précède /chat/completions dans la doc du fournisseur "
+                "(ex. https://api.mistral.ai/v1, ou …/api/v2 pour Paradigm/LiveIntelligence).")
+    if status in (400, 422) and "tool" in str(e).lower():
+        return (f"{e} — ce modèle ou ce fournisseur ne gère pas l'appel d'outils, nécessaire à l'agent. "
+                "Utilisez l'onglet « Propositions », qui fonctionne sans outils.")
+    if status == 401:
+        return f"{e} — clé d'API refusée."
+    return str(e)
+
+
+def make_llm(cfg: LLMConfig) -> ChatOpenAI:
+    return ChatOpenAI(
+        api_key=cfg.api_key, base_url=normalize_base_url(cfg.base_url), model=cfg.model,
+        temperature=0.3, timeout=180, max_retries=2,
+    )
+
+
+def _not_none(out: Any) -> Any:
+    if out is None:  # the model answered in plain text instead of calling the tool
+        raise ValueError("no structured output")
+    return out
+
+
+def _parse_text(schema: type[BaseModel]) -> Runnable:
+    def parse(msg: Any) -> BaseModel:
+        text = str(getattr(msg, "content", msg))
+        match = re.search(r"\{.*\}", text, re.S)
+        return schema.model_validate_json(match.group(0) if match else text)
+    return RunnableLambda(parse)
+
+
+def _structured(llm: ChatOpenAI, schema: type[BaseModel]) -> Runnable:
+    # Tool calling first, then JSON mode, then plain text parsing (the prompt already asks for JSON),
+    # so providers that support neither tools nor response_format still work.
+    return (llm.with_structured_output(schema, method="function_calling") | _not_none).with_fallbacks([
+        llm.with_structured_output(schema, method="json_mode") | _not_none,
+        llm | _parse_text(schema),
+    ])
+
+
+def build_agent(llm: ChatOpenAI, name: str) -> Runnable:
+    spec = AGENTS[name]
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", COMMON + "\n\n" + spec["system"]),
+        ("user", spec["user"]),
+    ]).partial(schema=json.dumps(spec["schema"].model_json_schema(), ensure_ascii=False))
+    chain = prompt | _structured(llm, spec["schema"]) | RunnableLambda(lambda out: out.model_dump())
+    # One failing agent must not break the others.
+    return chain.with_fallbacks(
+        [RunnableLambda(lambda x: {"error": explain_error(x["error"])})], exception_key="error"
+    )
+
+
+def target_text(cv: CV) -> str:
+    """The target job as plain text for the prompts."""
+    t = cv.settings.target
+    parts = [
+        f"Poste : {t.title}" if t.title else "",
+        f"Entreprise : {t.company}" if t.company else "",
+        f"Lien de l'offre : {t.offer_url}" if t.offer_url else "",
+        f"Mots-clés : {', '.join(t.keywords)}" if t.keywords else "",
+        f"Texte de l'offre :\n{t.offer_text.strip()[:6000]}" if t.offer_text.strip() else "",
+    ]
+    return "\n".join(p for p in parts if p) or "(non renseigné)"
+
+
+def _inputs(cv: CV, job: str) -> dict[str, str]:
+    p: Profile = cv.profile
+    exp = [e for e in p.experience if e.include]
+    dump = lambda items, **kw: json.dumps([i.model_dump(**kw) for i in items], ensure_ascii=False, indent=1)
+    compact = {
+        "basics": p.basics.model_dump(exclude={"websites", "email", "phone"}),
+        **{k: [i.model_dump(exclude={"include"}) for i in getattr(p, k) if i.include]
+           for k in ("experience", "education", "skills", "certifications", "languages", "projects")},
+    }
+    return {
+        "language": "français" if cv.settings.language == "fr" else "English",
+        "job": job.strip() or "(aucune)",
+        "profile": json.dumps(compact, ensure_ascii=False, indent=1),
+        "experience": dump(exp, include={"id", "title", "company", "description", "skills"}),
+        "experience_raw": dump(exp, include={"id", "title", "company", "location", "employment_type"}),
+        "education": dump([e for e in p.education if e.include], include={"id", "school", "degree", "field"}),
+        "skills": ", ".join(s.name for s in p.skills if s.include) or "(aucune)",
+        "exp_skills": ", ".join(sorted({s for e in exp for s in e.skills})) or "(aucune)",
+    }
+
+
+def enhance(cfg: LLMConfig, cv: CV, job_description: str, agents: list[str]) -> dict[str, Any]:
+    llm = make_llm(cfg)
+    selected = [a for a in agents if a in AGENTS] or list(AGENTS)
+    orchestrator = RunnableParallel({name: build_agent(llm, name) for name in selected})
+    job = job_description.strip() or target_text(cv)
+    return orchestrator.invoke(_inputs(cv, job), config={"max_concurrency": 3})
+
+
+def test_connection(cfg: LLMConfig) -> str:
+    return str(make_llm(cfg).invoke("Réponds juste: OK").content)[:50]

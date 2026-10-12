@@ -1,0 +1,8 @@
+ddgs==9.16.0
+fastapi==0.143.0
+langchain-openai==1.7.0
+langchain==1.4.4
+python-docx==1.2.0
+reportlab==5.0.1
+scrapling[fetchers]==0.4.15
+uvicorn[standard]==0.54.0

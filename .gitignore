@@ -1,42 +1,25 @@
-# dependencies
+# Python backend
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# LinkedIn browser sessions (cookies) — personal, never commit
+backend/.sessions/
+
+# Next.js frontend
 node_modules/
-/.pnp
-.pnp.js
-
-# testing
-/coverage
-
-# next.js
-/.next/
-/out/
-
-# production
-/build
-
-# misc
-.DS_Store
-*.pem
-
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# local env files
-.env*.local
-.env
-
-# vercel
-.vercel
-
-# typescript
-*.tsbuildinfo
+frontend/.next/
+frontend/out/
 next-env.d.ts
+*.tsbuildinfo
+
+# env / misc
+.env
+.env*.local
+.DS_Store
+*.log
 
 # debug files — contain personal data scraped from LinkedIn profiles.
-# Everything inside /debug is ignored EXCEPT .gitkeep and README.md so the
-# folder exists in the repo (the scraper needs it) without leaking any PII.
 /debug/*
 !/debug/.gitkeep
 !/debug/README.md
-

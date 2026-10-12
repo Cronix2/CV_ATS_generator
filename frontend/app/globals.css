@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #1c2633;
+  --color-muted: #5d6b7c;
+  --color-desk: #e9eef4;
+  --color-surface: #f6f8fb;
+  --color-line: #d3dbe5;
+  /* Actions */
+  --color-brand: #2557d6;
+  --color-brand-soft: #e8eefc;
+  /* Everything the AI does */
+  --color-ai: #6d3fd9;
+  --color-ai-soft: #f1ecfd;
+  /* The highlighter: what will appear on the CV */
+  --color-mark: #f6dc4a;
+  --color-ok: #1f8a5b;
+  --color-warn: #b7700a;
+  --color-danger: #c0392b;
+  --font-sans: var(--font-ui), system-ui, sans-serif;
+}
+
+html,
+body {
+  background: var(--color-desk);
+  color: var(--color-ink);
+}
+
+/* The highlighter: what will appear on the CV is marked like a recruiter would. */
+.marked {
+  background: linear-gradient(transparent 52%, color-mix(in srgb, var(--color-mark) 85%, transparent) 52%, color-mix(in srgb, var(--color-mark) 85%, transparent) 92%, transparent 92%);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}
+
+/* One deliberate motion: new AI activity lines slide in as the agent works. */
+@keyframes feed-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+.feed-in {
+  animation: feed-in 0.25s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

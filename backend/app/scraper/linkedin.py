@@ -1,0 +1,367 @@
+"""LinkedIn profile scraper built on Scrapling's StealthySession.
+
+One browser session per scrape: log in with the user's credentials, then visit
+the profile page, the contact-info overlay and every /details/<section>/ page.
+The browser profile (cookies) is kept per account in `.sessions/` so we don't
+log in from scratch every time, which is what triggers LinkedIn's checks.
+"""
+
+import hashlib
+import logging
+import re
+import time
+from pathlib import Path
+from typing import Callable, Protocol
+
+from scrapling.fetchers import StealthySession
+from scrapling.parser import Selector
+
+from app.models import Basics, Profile
+from app.scraper import parsers
+from app.scraper.parsers import Entry
+
+log = logging.getLogger(__name__)
+
+SESSIONS_DIR = Path(__file__).resolve().parents[2] / ".sessions"
+DEBUG_DIR = Path(__file__).resolve().parents[3] / "debug"
+
+# Profile attribute -> LinkedIn /details/ slug
+SECTIONS: dict[str, str] = {
+    "experience": "experience",
+    "education": "education",
+    "certifications": "certifications",
+    "skills": "skills",
+    "languages": "languages",
+    "projects": "projects",
+    "volunteering": "volunteering-experiences",
+    "honors": "honors",
+    "publications": "publications",
+    "courses": "courses",
+}
+PARSERS: dict[str, Callable[[list[Entry]], list]] = {
+    "experience": parsers.parse_experience,
+    "education": parsers.parse_education,
+    "certifications": parsers.parse_certifications,
+    "skills": parsers.parse_skills,
+    "languages": parsers.parse_languages,
+    "projects": parsers.parse_projects,
+    "volunteering": parsers.parse_volunteering,
+    "honors": parsers.parse_honors,
+    "publications": parsers.parse_publications,
+    "courses": parsers.parse_courses,
+}
+
+
+class ScrapeError(Exception):
+    pass
+
+
+class Hooks(Protocol):
+    def progress(self, message: str, percent: int | None = None) -> None: ...
+    def ask_code(self, message: str) -> str | None: ...
+
+
+def normalize_profile_url(url: str) -> str:
+    m = re.search(r"linkedin\.com/in/([^/?#]+)", url.strip())
+    if not m:
+        raise ScrapeError("URL de profil LinkedIn invalide (attendu : https://www.linkedin.com/in/<identifiant>/)")
+    return f"https://www.linkedin.com/in/{m.group(1)}/"
+
+
+def _session_dir(email: str) -> str:
+    path = SESSIONS_DIR / hashlib.sha256(email.strip().lower().encode()).hexdigest()[:16]
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _text(node: Selector) -> str:
+    """Visible text of a node, keeping <br> as line breaks."""
+    html = re.sub(r"<br\s*/?>", "\n", node.html_content, flags=re.I)
+    return str(Selector(html).get_all_text(separator="", strip=False)).strip()
+
+
+# --------------------------------------------------------------------------- login
+
+# LinkedIn's login page has generated ids and a hidden duplicate form: match by type, keep visible ones.
+USER_INPUT = "input#username, input[name=session_key], input[autocomplete*=username], input[type=email]"
+PASSWORD_INPUT = "input#password, input[name=session_password], input[type=password]"
+ON_LOGIN = re.compile(r"/(login|uas/|checkpoint|authwall|signup)")
+
+
+def _login(session: StealthySession, email: str, password: str, hooks: Hooks, headless: bool, debug: bool) -> None:
+    errors: list[Exception] = []
+
+    def action(page):
+        try:
+            if not ON_LOGIN.search(page.url):
+                return  # persisted session: LinkedIn redirected us straight to the feed
+            hooks.progress("Connexion à LinkedIn…")
+            user = page.locator(USER_INPUT).filter(visible=True)
+            pwd = page.locator(PASSWORD_INPUT).filter(visible=True)
+            try:
+                pwd.first.wait_for(state="visible", timeout=15_000)
+            except Exception:
+                # "Welcome back" screen with a remembered account: switch to the regular form.
+                other = page.get_by_text(re.compile(r"(another account|autre compte)", re.I))
+                if not other.count():
+                    raise ScrapeError(
+                        f"Formulaire de connexion LinkedIn introuvable (page « {page.title()} » : {page.url}). "
+                        "Relancez avec « Afficher le navigateur » pour voir ce que LinkedIn affiche."
+                    )
+                other.first.click()
+                pwd.first.wait_for(state="visible", timeout=15_000)
+            if user.count():  # absent when LinkedIn only asks for the password
+                user.first.fill(email)
+            pwd.first.fill(password)
+            pwd.first.press("Enter")
+            try:  # leaves /login for the feed or a checkpoint; stays there on wrong credentials
+                page.wait_for_url(lambda u: "/login" not in u and "/uas/" not in u, timeout=20_000)
+            except Exception:
+                pass
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(2000)
+            _handle_checkpoint(page, hooks, headless)
+            if ON_LOGIN.search(page.url):
+                raise ScrapeError("Connexion refusée : identifiant ou mot de passe LinkedIn invalide.")
+        except Exception as e:  # Scrapling swallows page_action errors, keep them
+            errors.append(e)
+            if debug:
+                DEBUG_DIR.mkdir(exist_ok=True)
+                try:
+                    page.screenshot(path=str(DEBUG_DIR / "login-error.png"))
+                except Exception:
+                    pass
+
+    session.fetch("https://www.linkedin.com/login", page_action=action, google_search=False)
+    if errors:
+        raise errors[0] if isinstance(errors[0], ScrapeError) else ScrapeError(f"Échec de connexion : {errors[0]}")
+
+
+def _handle_checkpoint(page, hooks: Hooks, headless: bool) -> None:
+    deadline = time.time() + 300
+    notified = False
+    while "/checkpoint" in page.url or "/challenge" in page.url:
+        if time.time() > deadline:
+            raise ScrapeError("Vérification LinkedIn non terminée après 5 minutes.")
+        pin = page.locator("input[name=pin], input[id*=verification_pin], input[name*=verificationCode]")
+        if pin.count() and pin.first.is_visible():
+            code = hooks.ask_code("LinkedIn demande un code de vérification (envoyé par email ou SMS).")
+            if not code:
+                raise ScrapeError("Vérification annulée.")
+            pin.first.fill(code.strip())
+            page.locator("button[type=submit], #email-pin-submit-button, #pin-submit-button").first.click()
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(3000)
+            continue
+        if page.locator("iframe[src*=captcha], #captcha-internal, iframe[title*=captcha i]").count():
+            if headless:
+                raise ScrapeError(
+                    "LinkedIn affiche un captcha. Relancez avec l'option « Afficher le navigateur » pour le résoudre."
+                )
+            if not notified:
+                hooks.progress("Résolvez le captcha dans la fenêtre du navigateur…")
+                notified = True
+        elif not notified:
+            hooks.progress("LinkedIn demande une validation : approuvez la connexion dans l'application mobile…")
+            notified = True
+        page.wait_for_timeout(3000)
+
+
+# --------------------------------------------------------------------------- pages
+
+TOP_CARD_JS = """() => {
+  const main = document.querySelector('main') || document.body;
+  const h1 = main.querySelector('h1');
+  const section = (h1 && h1.closest('section')) || main;
+  let aboutText = '';
+  // New UI: a section titled "About"/"Infos" with an expandable text box. Old UI: an #about anchor.
+  const aboutSec = [...main.querySelectorAll('section')].find(
+    s => /^(about|infos|à propos)$/i.test((s.innerText || '').trim().split('\\n')[0].trim()));
+  const box = aboutSec && aboutSec.querySelector('[data-testid="expandable-text-box"]');
+  if (box) {
+    aboutText = box.innerText.trim();
+  } else if (document.getElementById('about')) {
+    const spans = [...document.getElementById('about').closest('section').querySelectorAll('span[aria-hidden="true"]')];
+    aboutText = spans.map(s => s.innerText.trim()).sort((a, b) => b.length - a.length)[0] || '';
+  }
+  return {
+    name: h1 ? h1.innerText.trim() : document.title.replace(/^\\(\\d+\\)\\s*/, '').split('|')[0].trim(),
+    lines: section.innerText.split('\\n').map(s => s.trim()).filter(Boolean),
+    about: aboutText,
+  };
+}"""
+
+EXPAND_JS = """() => {
+  const re = /^(show more results|afficher plus de résultats|voir plus de résultats|afficher plus|show more)$/i;
+  const btn = [...document.querySelectorAll('main button')].find(b => re.test(b.innerText.trim()));
+  if (btn) { btn.click(); return true; }
+  return false;
+}"""
+
+# Lists are lazy-loaded while scrolling (and the scroller may be an inner element, not the window):
+# bring the last item into view until the number of items stops growing.
+SCROLL_JS = """() => {
+  const items = document.querySelectorAll('main [componentkey^="entity-collection-item"], main li');
+  if (items.length) items[items.length - 1].scrollIntoView({block: 'end'});
+  window.scrollBy(0, 2500);
+  return items.length;
+}"""
+
+PRONOUNS = re.compile(r"^(he|she|they|il|elle|iel)/", re.I)
+CONTACT = re.compile(r"^(contact info|coordonnées)$", re.I)
+
+
+def _scroll_and_expand(page) -> None:
+    last, stable = -1, 0
+    for _ in range(60):
+        count = page.evaluate(SCROLL_JS)
+        page.wait_for_timeout(700)
+        if page.evaluate(EXPAND_JS):
+            page.wait_for_timeout(1200)
+            stable = 0
+            continue
+        stable = stable + 1 if count == last else 0
+        last = count
+        if stable >= 3:
+            break
+
+
+def _parse_top_card(data: dict, url: str) -> Basics:
+    name = data.get("name", "")
+    lines = [l for l in data.get("lines", []) if l not in ("·", "•")]
+    basics = Basics(full_name=name, linkedin_url=url, summary=data.get("about", ""))
+    if name in lines:
+        after = [l for l in lines[lines.index(name) + 1:] if not PRONOUNS.match(l) and not l.startswith("·")]
+        basics.headline = after[0] if after else ""
+    contact_idx = next((i for i, l in enumerate(lines) if CONTACT.match(l)), None)
+    if contact_idx:
+        candidate = lines[contact_idx - 1]
+        if candidate not in (name, basics.headline):
+            basics.location = candidate
+    return basics
+
+
+def _parse_about(page: Selector) -> str:
+    """About text from the final HTML (the section is lazy-loaded, often after TOP_CARD_JS ran)."""
+    for sec in page.xpath("//main//section"):
+        head = str(sec.get_all_text(separator="\n", strip=True)).split("\n", 1)[0].strip()
+        if re.fullmatch(r"(about|infos|à propos)", head, re.I):
+            box = sec.css('[data-testid="expandable-text-box"]')
+            return _text(box[0]) if box else ""
+    return ""
+
+
+def _parse_contact(page: Selector, basics: Basics) -> None:
+    # The overlay is a dialog outside <main> (role=dialog before, data-testid=dialog-content now);
+    # pick the one that links to the profile, not the ad dialogs.
+    dialogs = [d for d in page.css('[role=dialog], [data-testid="dialog-content"]')
+               if any("/in/" in h or h.startswith("mailto:") for h in d.css("a::attr(href)").getall())]
+    scope = dialogs[0] if dialogs else page
+    basics.email = next((h[7:] for h in scope.css("a::attr(href)").getall() if h.startswith("mailto:")), "")
+    basics.websites = [
+        h for h in scope.css("a::attr(href)").getall()
+        if h.startswith("http") and "linkedin.com" not in h
+    ]
+    text = str(scope.get_all_text(separator="\n", strip=True))
+    phone = re.search(r"(?:Phone|Téléphone)\s*\n\s*(\+?[\d(][\d ().-]{5,}\d)", text)  # stays on one line
+    if phone:
+        basics.phone = phone.group(1).strip()
+
+
+# New LinkedIn UI ("SDUI"): one block per entry, one <p> per text line, grouped roles as nested <li>.
+# Paragraphs inside external links are attachments (Instagram post, PDF…), not entry text.
+SDUI_ITEMS = '//main//*[starts-with(@componentkey, "entity-collection-item")]'
+SDUI_LINES = ('.//p[count(ancestor::li)={depth}]'
+              '[not(ancestor::a[starts-with(@href, "http") and not(contains(@href, "linkedin.com"))])]')
+
+
+def _entries(page: Selector) -> list[Entry]:
+    items = page.xpath(SDUI_ITEMS)
+    if items:
+        out = []
+        for it in items:
+            children = [Entry(lines=[_text(p) for p in li.xpath(SDUI_LINES.format(depth=1))])
+                        for li in it.xpath(".//li[count(ancestor::li)=0]")]
+            entry = Entry(lines=[_text(p) for p in it.xpath(SDUI_LINES.format(depth=0))],
+                          links=it.css("a::attr(href)").getall(),
+                          children=[c for c in children if any(c.lines)])
+            if any(entry.lines):
+                out.append(entry)
+        return out
+
+    # Previous UI: <li> items with visible text duplicated in span[aria-hidden=true].
+    out = []
+    for li in page.xpath("//main//ul/li[not(ancestor::li)]"):
+        lines = [_text(s) for s in li.xpath('.//span[@aria-hidden="true"][count(ancestor::li)=1]')]
+        if not any(lines):
+            continue
+        children = [
+            Entry(lines=[_text(s) for s in c.xpath('.//span[@aria-hidden="true"][count(ancestor::li)=2]')])
+            for c in li.xpath("./descendant::li[count(ancestor::li)=1]")
+        ]
+        out.append(Entry(lines=lines, links=li.css("a::attr(href)").getall(), children=children))
+    return out
+
+
+def _empty_section(page: Selector) -> bool:
+    main = page.css("main")  # css() returns a list of matches
+    text = str(main[0].get_all_text(separator=" ")) if main else ""
+    return bool(re.search(r"(nothing to see for now|rien à voir pour le moment|n'a pas encore ajouté)", text, re.I))
+
+
+# --------------------------------------------------------------------------- entry point
+
+def scrape_profile(url: str, email: str, password: str, hooks: Hooks,
+                   headless: bool = True, debug: bool = False) -> Profile:
+    base = normalize_profile_url(url)
+    with StealthySession(
+        headless=headless,
+        user_data_dir=_session_dir(email),
+        locale="en-US",  # stable UI labels/date formats for the parsers
+        timeout=45_000,
+        retries=1,
+        google_search=False,
+    ) as session:
+        _login(session, email, password, hooks, headless, debug)
+        hooks.progress("Lecture du profil…", 10)
+
+        top: dict = {}
+        profile_page = session.fetch(base, page_action=lambda p: top.update(p.evaluate(TOP_CARD_JS)), wait=1500)
+        if "/in/" not in str(profile_page.url) and "authwall" in str(profile_page.url):
+            raise ScrapeError("Session LinkedIn invalide : reconnexion nécessaire.")
+        basics = _parse_top_card(top, base)
+        basics.summary = basics.summary or _parse_about(profile_page)
+        if not basics.full_name:
+            raise ScrapeError("Profil introuvable ou inaccessible (vérifiez l'URL).")
+
+        hooks.progress("Lecture des coordonnées…", 15)
+        contact = session.fetch(base + "overlay/contact-info/", wait=1500)
+        try:
+            _parse_contact(contact, basics)
+        except Exception:
+            log.exception("Contact info parsing failed")
+            hooks.progress("Coordonnées non lues : à compléter à la main.")
+        profile = Profile(basics=basics)
+        if debug:
+            _dump("profile", profile_page)
+            _dump("contact", contact)
+
+        for i, (attr, slug) in enumerate(SECTIONS.items()):
+            hooks.progress(f"Section « {attr} »…", 20 + int(75 * i / len(SECTIONS)))
+            page = session.fetch(f"{base}details/{slug}/", page_action=_scroll_and_expand, wait=500)
+            if debug:
+                _dump(attr, page)
+            try:  # one broken section must not kill the whole scrape
+                if not _empty_section(page):
+                    setattr(profile, attr, PARSERS[attr](_entries(page)))
+            except Exception:
+                log.exception("Parsing failed for %s", attr)
+                hooks.progress(f"Section « {attr} » ignorée (lecture impossible).")
+            time.sleep(1)  # be gentle with LinkedIn
+        hooks.progress("Extraction terminée.", 100)
+        return profile
+
+
+def _dump(name: str, page: Selector) -> None:
+    DEBUG_DIR.mkdir(exist_ok=True)
+    (DEBUG_DIR / f"{name}.html").write_text(page.html_content, encoding="utf-8")
