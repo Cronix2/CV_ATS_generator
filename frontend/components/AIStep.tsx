@@ -96,7 +96,8 @@ function Changes({ changes }: { changes: AgentChange[] }) {
 }
 
 function AgentPanel() {
-  const { cv, update, checkpoint, llm } = useStore();
+  const { cv, update, checkpoint, llm, server } = useStore();
+  const model = llm.api_key.trim() ? llm.model : server?.llm.model;
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
   const [jobId, setJobId] = useState("");
@@ -144,7 +145,9 @@ function AgentPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId]);
 
-  useEffect(() => bottom.current?.scrollIntoView({ block: "nearest" }), [turns]);
+  useEffect(() => {
+    bottom.current?.scrollIntoView({ block: "nearest" }); // no return: may be a Promise in recent browsers
+  }, [turns]);
 
   async function send(text: string) {
     const instruction = text.trim();
@@ -243,7 +246,7 @@ function AgentPanel() {
         />
         {error && <div className="mt-2"><Alert>{error}</Alert></div>}
         <div className="mt-2 flex items-center justify-between gap-2">
-          <span className="text-xs text-muted">Ctrl + Entrée pour envoyer · modèle : {llm.model}</span>
+          <span className="text-xs text-muted">Ctrl + Entrée pour envoyer · modèle : {model}</span>
           <Button variant="ai" disabled={running || !input.trim()} onClick={() => send(input)}>
             {running ? <Spinner /> : <Send className="size-4" aria-hidden />} {running ? "L'agent travaille…" : "Envoyer"}
           </Button>
@@ -254,10 +257,10 @@ function AgentPanel() {
 }
 
 export function AIStep() {
-  const { llm, setStep } = useStore();
+  const { aiReady, setStep } = useStore();
   const [tab, setTab] = useState<"agent" | "suggestions">("agent");
 
-  if (!llm.api_key)
+  if (!aiReady)
     return (
       <div className="space-y-3">
         <h1 className="text-2xl font-semibold tracking-tight">Agent IA</h1>

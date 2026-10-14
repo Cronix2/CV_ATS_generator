@@ -89,8 +89,8 @@ export function TargetCard() {
           </div>
           {match.keywords.length > 0 ? (
             <div className="flex flex-wrap gap-1.5">
-              {match.keywords.map((k) => (
-                <Chip key={k} tone={match.found.includes(k) ? "ok" : "missing"} onRemove={() => set({ keywords: match.keywords.filter((x) => x !== k) })}>
+              {match.keywords.map((k, i) => (
+                <Chip key={i} tone={match.found.includes(k) ? "ok" : "missing"} onRemove={() => set({ keywords: match.keywords.filter((x) => x !== k) })}>
                   {match.found.includes(k) ? "✓" : "✗"} {k}
                 </Chip>
               ))}

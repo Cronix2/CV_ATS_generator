@@ -7,8 +7,11 @@ log in from scratch every time, which is what triggers LinkedIn's checks.
 """
 
 import hashlib
+import hmac
 import logging
 import re
+import secrets
+import shutil
 import time
 from pathlib import Path
 from typing import Callable, Protocol
@@ -17,6 +20,7 @@ from scrapling.fetchers import StealthySession
 from scrapling.parser import Selector
 
 from app.models import Basics, Profile
+from app.security import PublicError
 from app.scraper import parsers
 from app.scraper.parsers import Entry
 
@@ -52,7 +56,7 @@ PARSERS: dict[str, Callable[[list[Entry]], list]] = {
 }
 
 
-class ScrapeError(Exception):
+class ScrapeError(PublicError):
     pass
 
 
@@ -68,16 +72,48 @@ def normalize_profile_url(url: str) -> str:
     return f"https://www.linkedin.com/in/{m.group(1)}/"
 
 
-def _session_dir(email: str) -> str:
-    path = SESSIONS_DIR / hashlib.sha256(email.strip().lower().encode()).hexdigest()[:16]
-    path.mkdir(parents=True, exist_ok=True)
+def _server_secret() -> bytes:
+    """Random per-install secret, so session folder names can't be derived from an email alone."""
+    SESSIONS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    secret_file = SESSIONS_DIR / ".secret"
+    if not secret_file.exists():
+        secret_file.write_bytes(secrets.token_bytes(32))
+        secret_file.chmod(0o600)
+    return secret_file.read_bytes()
+
+
+def _session_path(email: str, password: str) -> Path:
+    """Browser profile (LinkedIn cookies) bound to email AND password: knowing someone's email is not
+    enough to reuse their session; a wrong password lands in an empty profile and a real, failing login."""
+    key = f"{email.strip().lower()}\0{password}".encode()
+    return SESSIONS_DIR / hmac.new(_server_secret(), key, hashlib.sha256).hexdigest()[:32]
+
+
+def _session_dir(email: str, password: str) -> str:
+    path = _session_path(email, password)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
     return str(path)
 
 
+def forget_session(email: str, password: str) -> bool:
+    """Delete the saved LinkedIn session of this account (needs its credentials: nobody can wipe someone else's)."""
+    path = _session_path(email, password)
+    if not path.exists():
+        return False
+    shutil.rmtree(path, ignore_errors=True)
+    return True
+
+
+SEE_MORE = re.compile(r"\s*(…|\.\.\.)\s*(plus|voir plus|afficher plus|see more|more)\s*$", re.I)
+
+
 def _text(node: Selector) -> str:
-    """Visible text of a node, keeping <br> as line breaks."""
-    html = re.sub(r"<br\s*/?>", "\n", node.html_content, flags=re.I)
-    return str(Selector(html).get_all_text(separator="", strip=False)).strip()
+    """Visible text of a node, keeping <br> as line breaks.
+
+    Buttons are dropped: LinkedIn puts its "… plus" / "…see more" toggle inside the text itself."""
+    html = re.sub(r"<button\b.*?</button>", "", node.html_content, flags=re.I | re.S)
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    return SEE_MORE.sub("", str(Selector(html).get_all_text(separator="", strip=False)).strip())
 
 
 # --------------------------------------------------------------------------- login
@@ -134,7 +170,10 @@ def _login(session: StealthySession, email: str, password: str, hooks: Hooks, he
 
     session.fetch("https://www.linkedin.com/login", page_action=action, google_search=False)
     if errors:
-        raise errors[0] if isinstance(errors[0], ScrapeError) else ScrapeError(f"Échec de connexion : {errors[0]}")
+        if isinstance(errors[0], ScrapeError):
+            raise errors[0]
+        log.error("LinkedIn login failed: %r", errors[0])  # browser internals stay in the logs
+        raise ScrapeError("Échec de la connexion à LinkedIn. Réessayez, ou cochez « Afficher le navigateur » pour voir ce qui bloque.")
 
 
 def _handle_checkpoint(page, hooks: Hooks, headless: bool) -> None:
@@ -211,6 +250,32 @@ PRONOUNS = re.compile(r"^(he|she|they|il|elle|iel)/", re.I)
 CONTACT = re.compile(r"^(contact info|coordonnées)$", re.I)
 
 
+# Truncated texts ("… plus" / "…see more"): click every toggle so the full text is in the DOM.
+EXPAND_TEXT_JS = """() => {
+  const re = /^(…|\\.\\.\\.)?\\s*(plus|voir plus|afficher plus|see more|more)$/i;
+  let clicked = 0;
+  document.querySelectorAll(
+    'main [data-testid="expandable-text-button"], main .inline-show-more-text__button, main button, main [role="button"]'
+  ).forEach(b => {
+    const isToggle = b.matches('[data-testid="expandable-text-button"], .inline-show-more-text__button')
+      || re.test((b.innerText || '').trim());
+    if (isToggle && b.getAttribute('aria-expanded') !== 'true' && !b.dataset.pfClicked) {
+      b.dataset.pfClicked = '1';
+      b.click();
+      clicked++;
+    }
+  });
+  return clicked;
+}"""
+
+
+def _expand_texts(page) -> None:
+    for _ in range(3):  # new toggles can appear once a section is expanded
+        if not page.evaluate(EXPAND_TEXT_JS):
+            break
+        page.wait_for_timeout(600)
+
+
 def _scroll_and_expand(page) -> None:
     last, stable = -1, 0
     for _ in range(60):
@@ -224,6 +289,18 @@ def _scroll_and_expand(page) -> None:
         last = count
         if stable >= 3:
             break
+    _expand_texts(page)
+
+
+def _profile_action(top: dict):
+    """Profile page: read the top card, then load the lazy sections (About…) and expand their texts."""
+    def action(page) -> None:
+        top.update(page.evaluate(TOP_CARD_JS))
+        for _ in range(6):
+            page.evaluate("() => window.scrollBy(0, 1500)")
+            page.wait_for_timeout(500)
+        _expand_texts(page)
+    return action
 
 
 def _parse_top_card(data: dict, url: str) -> Basics:
@@ -316,7 +393,7 @@ def scrape_profile(url: str, email: str, password: str, hooks: Hooks,
     base = normalize_profile_url(url)
     with StealthySession(
         headless=headless,
-        user_data_dir=_session_dir(email),
+        user_data_dir=_session_dir(email, password),
         locale="en-US",  # stable UI labels/date formats for the parsers
         timeout=45_000,
         retries=1,
@@ -326,7 +403,7 @@ def scrape_profile(url: str, email: str, password: str, hooks: Hooks,
         hooks.progress("Lecture du profil…", 10)
 
         top: dict = {}
-        profile_page = session.fetch(base, page_action=lambda p: top.update(p.evaluate(TOP_CARD_JS)), wait=1500)
+        profile_page = session.fetch(base, page_action=_profile_action(top), wait=1000)
         if "/in/" not in str(profile_page.url) and "authwall" in str(profile_page.url):
             raise ScrapeError("Session LinkedIn invalide : reconnexion nécessaire.")
         basics = _parse_top_card(top, base)

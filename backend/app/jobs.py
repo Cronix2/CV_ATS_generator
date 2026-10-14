@@ -1,9 +1,15 @@
 """In-memory background jobs for scraping (a scrape takes ~1 min and may need a 2FA code)."""
 
+import logging
+import os
 import threading
 import time
 from typing import Any, Callable
 from uuid import uuid4
+
+from app.security import PublicError
+
+log = logging.getLogger(__name__)
 
 JOB_TTL = 3600
 
@@ -47,9 +53,18 @@ class Job:
 
 
 _jobs: dict[str, Job] = {}
+# Each job holds a Chromium or a series of LLM calls: cap how many run at once (memory and cost).
+_slots = threading.BoundedSemaphore(max(1, int(os.getenv("MAX_JOBS", "2"))))
+
+
+class Busy(Exception):
+    pass
 
 
 def start(target: Callable[[Job], Any]) -> Job:
+    slots = _slots  # release exactly the semaphore we acquired
+    if not slots.acquire(blocking=False):
+        raise Busy("Trop de tâches en cours (extraction ou agent IA) : réessayez dans un instant.")
     for jid in [j for j, job in _jobs.items() if time.time() - job.created > JOB_TTL]:
         _jobs.pop(jid, None)
     job = Job()
@@ -59,8 +74,13 @@ def start(target: Callable[[Job], Any]) -> Job:
         try:
             job.result = target(job)
             job.status = "done"
-        except Exception as e:
-            job.error, job.status = str(e) or e.__class__.__name__, "error"
+        except PublicError as e:  # written for the user
+            job.error, job.status = str(e), "error"
+        except Exception:
+            log.exception("Job %s failed", job.id)
+            job.error, job.status = "Erreur interne (détail dans les logs du serveur).", "error"
+        finally:
+            slots.release()
 
     threading.Thread(target=run, daemon=True).start()
     return job

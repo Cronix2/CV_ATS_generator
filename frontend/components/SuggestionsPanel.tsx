@@ -128,7 +128,7 @@ export function SuggestionsPanel() {
               {[["Points forts", r.ats_review.strengths], ["À améliorer", r.ats_review.improvements]].map(([label, list]) => (
                 <div key={label as string}>
                   <p className="font-medium">{label as string}</p>
-                  <ul className="mt-1 list-disc space-y-1 pl-5 text-muted">{(list as string[]).map((x) => <li key={x}>{x}</li>)}</ul>
+                  <ul className="mt-1 list-disc space-y-1 pl-5 text-muted">{(list as string[]).map((x, i) => <li key={i}>{x}</li>)}</ul>
                 </div>
               ))}
             </Card>
@@ -182,8 +182,8 @@ export function SuggestionsPanel() {
                   <p className="font-medium">Mots-clés de l&apos;offre absents du profil</p>
                   <p className="text-xs text-muted">N&apos;ajoutez que ceux que vous maîtrisez vraiment.</p>
                   <div className="mt-2 flex flex-wrap gap-2">
-                    {r.skills.missing_keywords.map((k) => (
-                      <Button key={k} variant="secondary" className="rounded-full py-1" disabled={applied.has(`kw-${k}`)}
+                    {r.skills.missing_keywords.map((k, i) => (
+                      <Button key={i} variant="secondary" className="rounded-full py-1" disabled={applied.has(`kw-${k}`)}
                         onClick={() => { update((c) => ({ ...c, profile: { ...c.profile, skills: [...c.profile.skills, { ...newItem("skills"), name: k }] } })); mark(`kw-${k}`); }}>
                         + {k}
                       </Button>

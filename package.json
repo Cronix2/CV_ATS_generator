@@ -1,0 +1,15 @@
+{
+  "name": "passefiltre",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PasseFiltre : transforme un profil LinkedIn en CV qui passe le filtre des ATS.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "setup": "node scripts/passefiltre.mjs setup",
+    "start": "node scripts/passefiltre.mjs start",
+    "prod": "node scripts/passefiltre.mjs prod",
+    "test": "node scripts/passefiltre.mjs test"
+  }
+}

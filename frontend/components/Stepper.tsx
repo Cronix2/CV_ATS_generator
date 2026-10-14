@@ -2,6 +2,7 @@
 
 import { Download, KeyRound, ListChecks, ScanSearch, Sparkles, Undo2, type LucideIcon } from "lucide-react";
 import { hasContent, useStore, type Step } from "@/lib/store";
+import { Logo } from "./Logo";
 
 const STEPS: { id: Step; label: string; Icon: LucideIcon }[] = [
   { id: "connect", label: "Connexion", Icon: KeyRound },
@@ -19,9 +20,9 @@ export function Stepper() {
   return (
     <header className="sticky top-0 z-20 border-b border-line bg-white/95 backdrop-blur">
       <div className="mx-auto flex max-w-[1400px] flex-wrap items-center gap-x-6 gap-y-2 px-4 py-2.5 lg:px-8">
-        <p className="text-[15px] font-semibold tracking-tight">
-          <span className="marked">CV ATS</span> <span className="font-normal text-muted">depuis LinkedIn</span>
-        </p>
+        <button type="button" onClick={() => setStep("connect")} aria-label="PasseFiltre, retour à l'accueil" className="rounded-md">
+          <Logo />
+        </button>
         <nav aria-label="Étapes" className="-mx-1 overflow-x-auto">
           <ol className="flex gap-1">
             {STEPS.map((s, i) => {

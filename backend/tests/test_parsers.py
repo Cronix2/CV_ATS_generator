@@ -145,3 +145,11 @@ def test_sdui_about_and_contact():
         <p>E-mail</p><a href="mailto:jane@example.com">jane@example.com</a>
         <a href="https://jane.dev">site</a></div>"""), b)
     assert (b.email, b.websites) == ("jane@example.com", ["https://jane.dev"])
+
+
+def test_see_more_toggle_is_not_part_of_the_text():
+    from app.scraper.linkedin import _text
+    box = Selector('<span data-testid="expandable-text-box">Ligne 1<br>Fin du texte.'
+                   '<button data-testid="expandable-text-button"><span>… plus</span></button></span>')
+    assert _text(box.css("span")[0]) == "Ligne 1\nFin du texte."
+    assert _text(Selector("<p>Résumé tronqué…see more</p>").css("p")[0]) == "Résumé tronqué"

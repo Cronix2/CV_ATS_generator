@@ -1,0 +1,21 @@
+# PasseFiltre behind HTTPS (docker compose --profile https up).
+# SITE_ADDRESS: a public domain (automatic Let's Encrypt certificate) or a LAN name / IP
+# (certificate from Caddy's local authority: install its root on client machines, see README).
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# One origin for the UI and the API: no CORS needed from the browser's point of view.
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+	handle {
+		reverse_proxy web:3000
+	}
+}

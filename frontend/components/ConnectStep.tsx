@@ -13,11 +13,12 @@ const PROVIDERS = [
   { label: "Paradigm (Orange LiveIntelligence)", base_url: "https://trust.liveintelligence.orange-business.com/api/v2", model: "alfred-4.2" },
   { label: "Mistral", base_url: "https://api.mistral.ai/v1", model: "mistral-small-latest" },
   { label: "OpenRouter", base_url: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini" },
-  { label: "Ollama (local)", base_url: "http://localhost:11434/v1", model: "llama3.1" },
+  { label: "Ollama (local, nécessite ALLOW_LOCAL_LLM=1 dans .env)", base_url: "http://localhost:11434/v1", model: "llama3.1" },
 ];
 
 export function ConnectStep() {
-  const { cv, update, llm, setLlm, setStep, setJobId } = useStore();
+  const { cv, update, llm, setLlm, setStep, setJobId, server, token, setToken } = useStore();
+  const serverKey = Boolean(server?.llm.server_key);
   const [url, setUrl] = useState(cv.profile.basics.linkedin_url);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -41,6 +42,20 @@ export function ConnectStep() {
       setError((err as Error).message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  const [sessionNote, setSessionNote] = useState("");
+
+  // Deletes the LinkedIn cookies kept for this account on the server (needs the same email + password).
+  async function forgetSession() {
+    setError("");
+    setSessionNote("");
+    try {
+      const { removed } = await api.forgetLinkedInSession({ email, password });
+      setSessionNote(removed ? "Session LinkedIn effacée du serveur." : "Aucune session enregistrée pour ces identifiants.");
+    } catch (err) {
+      setError((err as Error).message);
     }
   }
 
@@ -87,6 +102,11 @@ export function ConnectStep() {
           <IconTile Icon={ScanSearch} color="#2557d6" />
           <h2 className="text-lg font-semibold">Profil à extraire</h2>
         </div>
+        {server?.auth_required && (
+          <Field label="Jeton d'accès PasseFiltre" hint="Ce serveur est protégé : demandez le jeton (PASSEFILTRE_TOKEN) à la personne qui l'héberge.">
+            <Input type="password" required autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} />
+          </Field>
+        )}
         <Field label="Adresse du profil LinkedIn">
           <Input type="url" required value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://www.linkedin.com/in/votre-identifiant/" />
         </Field>
@@ -98,13 +118,16 @@ export function ConnectStep() {
             <Input type="password" required autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
           </Field>
         </div>
-        <label className="flex items-start gap-2 text-sm">
-          <input type="checkbox" className="mt-0.5 accent-brand" checked={showBrowser} onChange={(e) => setShowBrowser(e.target.checked)} />
-          <span>
-            Afficher le navigateur pendant l&apos;extraction
-            <span className="block text-xs text-muted">À cocher si LinkedIn demande un captcha : vous le résolvez dans la fenêtre.</span>
-          </span>
-        </label>
+        {/* In Docker there is no screen to show a browser window on. */}
+        {!server?.docker && (
+          <label className="flex items-start gap-2 text-sm">
+            <input type="checkbox" className="mt-0.5 accent-brand" checked={showBrowser} onChange={(e) => setShowBrowser(e.target.checked)} />
+            <span>
+              Afficher le navigateur pendant l&apos;extraction
+              <span className="block text-xs text-muted">À cocher si LinkedIn demande un captcha : vous le résolvez dans la fenêtre.</span>
+            </span>
+          </label>
+        )}
         <p className="text-xs text-muted">
           Le compte sert à ouvrir une session LinkedIn sur votre machine pour lire le profil, à un rythme raisonnable.
           Le mot de passe n&apos;est ni enregistré ni journalisé ; seuls les cookies de session sont gardés localement
@@ -120,7 +143,11 @@ export function ConnectStep() {
               Reprendre le CV en cours
             </Button>
           )}
+          <Button variant="ghost" className="ml-auto" disabled={!email || !password || busy} onClick={forgetSession}>
+            Oublier ma session LinkedIn
+          </Button>
         </div>
+        {sessionNote && <Alert tone="info">{sessionNote}</Alert>}
       </form>
 
       <section className="space-y-4 rounded-lg border border-line border-t-3 border-t-ai bg-white p-5 sm:p-6">
@@ -158,9 +185,15 @@ export function ConnectStep() {
             <Input type="url" value={llm.base_url} onChange={(e) => setLlm({ ...llm, base_url: e.target.value })} placeholder="https://api.mistral.ai/v1" />
           </Field>
         </div>
-        <p className="text-xs text-muted">La clé reste dans cet onglet et disparaît à sa fermeture.</p>
+        {serverKey && !llm.api_key && (
+          <Alert tone="ai">
+            Un LLM est déjà configuré sur le serveur (fichier <code>.env</code>, modèle <strong>{server?.llm.model}</strong>) :
+            laissez la clé vide pour l&apos;utiliser.
+          </Alert>
+        )}
+        <p className="text-xs text-muted">La clé saisie ici reste dans cet onglet et disparaît à sa fermeture.</p>
         {llmStatus && <Alert tone={llmStatus.tone}>{llmStatus.text}</Alert>}
-        <Button variant="secondary" disabled={!llm.api_key || !llm.model || testing} onClick={testLlm}>
+        <Button variant="secondary" disabled={(!llm.api_key && !serverKey) || testing} onClick={testLlm}>
           {testing && <Spinner />} Tester la connexion
         </Button>
       </section>

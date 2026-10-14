@@ -1,0 +1,65 @@
+# PasseFiltre with Docker: `docker compose up --build`, then open http://localhost:3000
+# Configuration: the same root .env as the local launcher (copy .env.example to .env).
+# Prebuilt images (published by the release workflow): `docker compose pull && docker compose up`.
+# On a network, behind HTTPS: `docker compose --profile https up -d` (see README, "Mise en réseau").
+services:
+  api:
+    build: ./backend
+    image: ghcr.io/cronix2/passefiltre-api:latest
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT:-3000}}
+      # Lets the API know it is exposed: it then refuses to start without a strong PASSEFILTRE_TOKEN.
+      BIND_ADDRESS: ${BIND_ADDRESS:-127.0.0.1}
+      # Behind the HTTPS proxy the browser calls https://SITE_ADDRESS: accept that Host header.
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-${SITE_ADDRESS:-}}
+      # The API is only reachable through published ports / the proxy: trust X-Forwarded-For from the proxy.
+      FORWARDED_ALLOW_IPS: "*"
+    ports:
+      # Published on this machine only. To reach PasseFiltre from another computer, prefer the `https` profile.
+      - "${BIND_ADDRESS:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - sessions:/app/.sessions   # LinkedIn session cookies, kept between restarts
+    shm_size: 1gb                 # Chromium needs more than Docker's default 64 MB
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:${BACKEND_PORT:-8000}}
+    image: ghcr.io/cronix2/passefiltre-web:latest
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - api
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  # HTTPS entry point for network use (optional profile).
+  proxy:
+    image: caddy:2.10-alpine
+    profiles: ["https"]
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+    ports:
+      - "${HTTPS_BIND:-0.0.0.0}:80:80"
+      - "${HTTPS_BIND:-0.0.0.0}:443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data         # certificates (and the local CA for LAN names)
+      - caddy_config:/config
+    depends_on:
+      - api
+      - web
+    restart: unless-stopped
+
+volumes:
+  sessions:
+  caddy_data:
+  caddy_config:

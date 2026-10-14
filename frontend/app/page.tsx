@@ -12,7 +12,11 @@ import { StoreProvider, useStore } from "@/lib/store";
 
 function Workbench() {
   const { step } = useStore();
-  useEffect(() => window.scrollTo({ top: 0 }), [step]); // each step starts at its top
+  // Each step starts at its top. Braces matter: recent browsers return a Promise from scrollTo,
+  // and an effect must return nothing (or a cleanup function).
+  useEffect(() => {
+    window.scrollTo({ top: 0 });
+  }, [step]);
   const withPreview = step === "edit" || step === "ai" || step === "export";
 
   return (

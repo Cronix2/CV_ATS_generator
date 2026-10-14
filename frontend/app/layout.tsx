@@ -5,8 +5,9 @@ import "./globals.css";
 const ui = Schibsted_Grotesk({ subsets: ["latin"], variable: "--font-ui" });
 
 export const metadata: Metadata = {
-  title: "CV ATS depuis LinkedIn",
-  description: "Transformez un profil LinkedIn en CV lisible par les ATS.",
+  title: "PasseFiltre · CV qui passe les ATS",
+  description: "PasseFiltre transforme un profil LinkedIn en CV qui passe le filtre des ATS.",
+  applicationName: "PasseFiltre",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

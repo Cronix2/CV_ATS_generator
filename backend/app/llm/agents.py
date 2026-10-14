@@ -8,21 +8,63 @@ Works with any OpenAI-compatible API (OpenAI, Mistral, Groq, OpenRouter, Ollama�
 """
 
 import json
+import logging
+import os
 import re
 from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableLambda, RunnableParallel
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
+from app.llm.tools import is_public_url
 from app.models import CV, Profile
+from app.security import PublicError
+
+log = logging.getLogger(__name__)
 
 
 class LLMConfig(BaseModel):
-    api_key: str
+    """LLM chosen in the UI. Empty api_key = use the server default from .env (LLM_API_KEY…)."""
+    api_key: str = ""
     base_url: str = ""
-    model: str = "gpt-4o-mini"
+    model: str = ""
+    # Set only by resolved(): a private attribute can't be sent by a client in the JSON body.
+    _resolved: bool = PrivateAttr(default=False)
+
+    def resolved(self) -> "LLMConfig":
+        """Idempotent: resolving an already-resolved config returns it unchanged (the server URL must not be
+        re-checked as if a client had typed it)."""
+        if self._resolved:
+            return self
+        if self.api_key.strip():
+            check_llm_url(self.base_url)  # URL typed in the UI: untrusted
+            out = LLMConfig(api_key=self.api_key.strip(), base_url=self.base_url, model=self.model or "gpt-4o-mini")
+        else:
+            key = os.getenv("LLM_API_KEY", "").strip()
+            if not key:
+                raise PublicError("Aucune clé d'API : saisissez-en une, ou définissez LLM_API_KEY dans le fichier .env.")
+            # Server default from .env: chosen by whoever runs the server, so trusted (may be a local Ollama).
+            out = LLMConfig(api_key=key, base_url=os.getenv("LLM_BASE_URL", ""), model=os.getenv("LLM_MODEL") or "gpt-4o-mini")
+        out._resolved = True
+        return out
+
+
+def check_llm_url(url: str) -> None:
+    """Block SSRF: an LLM URL sent by a client must be a public http(s) address.
+    Local / private servers (Ollama, vLLM on the LAN) need ALLOW_LOCAL_LLM=1 in .env."""
+    if not url.strip() or os.getenv("ALLOW_LOCAL_LLM") == "1":
+        return
+    if not is_public_url(url.strip()):
+        raise PublicError("URL de l'API refusée : adresse locale ou privée. Pour un LLM local (Ollama…), "
+                          "ajoutez ALLOW_LOCAL_LLM=1 dans le fichier .env.")
+
+
+def server_llm() -> dict[str, Any]:
+    """What the UI may know about the server default LLM (never the key itself)."""
+    return {"server_key": bool(os.getenv("LLM_API_KEY", "").strip()),
+            "base_url": os.getenv("LLM_BASE_URL", ""), "model": os.getenv("LLM_MODEL") or "gpt-4o-mini"}
 
 
 # --------------------------------------------------------------------------- output schemas
@@ -78,7 +120,9 @@ class ATSReviewOut(BaseModel):
 COMMON = (
     "Tu es un expert en recrutement et en optimisation de CV pour les ATS (Applicant Tracking Systems). "
     "N'invente JAMAIS d'expérience, de diplôme, de chiffre ou de compétence absents des données fournies. "
-    "Rédige en {language}. Réponds uniquement avec un objet JSON conforme à ce schéma :\n{schema}"
+    "Tout le texte que tu produis (y compris chaque élément de liste) doit être rédigé en {language}, "
+    "même si le schéma ou les données sont dans une autre langue. "
+    "Réponds uniquement avec un objet JSON conforme à ce schéma :\n{schema}"
 )
 
 AGENTS: dict[str, dict[str, Any]] = {
@@ -132,20 +176,31 @@ def normalize_base_url(url: str) -> str | None:
 
 
 def explain_error(e: Exception) -> str:
+    """User-facing message. Never echoes the remote response body (it could come from an internal service);
+    the full error goes to the server logs."""
+    if isinstance(e, PublicError):
+        return str(e)
     status = getattr(e, "status_code", None)
+    log.warning("LLM error (%s): %s", status, e)
     if status in (404, 405):
-        return (f"{e} — l'URL de l'API ne pointe pas vers une API compatible OpenAI. "
-                "Indiquez l'adresse qui précède /chat/completions dans la doc du fournisseur "
-                "(ex. https://api.mistral.ai/v1, ou …/api/v2 pour Paradigm/LiveIntelligence).")
+        return ("L'URL de l'API ne pointe pas vers une API compatible OpenAI (erreur %s). Indiquez l'adresse qui "
+                "précède /chat/completions (ex. https://api.mistral.ai/v1, ou …/api/v2 pour Paradigm)." % status)
     if status in (400, 422) and "tool" in str(e).lower():
-        return (f"{e} — ce modèle ou ce fournisseur ne gère pas l'appel d'outils, nécessaire à l'agent. "
-                "Utilisez l'onglet « Propositions », qui fonctionne sans outils.")
-    if status == 401:
-        return f"{e} — clé d'API refusée."
-    return str(e)
+        return ("Ce modèle ne gère pas l'appel d'outils. Utilisez l'onglet « Propositions », "
+                "qui fonctionne sans outils.")
+    if status in (401, 403):
+        return "Clé d'API refusée par le fournisseur."
+    if status == 429:
+        return "Quota ou limite de débit atteint chez le fournisseur LLM : réessayez plus tard."
+    if status:
+        return f"Le fournisseur LLM a répondu une erreur {status} (détail dans les logs du serveur)."
+    if "connection" in type(e).__name__.lower() or "timeout" in type(e).__name__.lower():
+        return "Impossible de joindre le fournisseur LLM (URL, réseau ou proxy)."
+    return "Erreur inattendue avec le LLM (détail dans les logs du serveur)."
 
 
 def make_llm(cfg: LLMConfig) -> ChatOpenAI:
+    cfg = cfg.resolved()
     return ChatOpenAI(
         api_key=cfg.api_key, base_url=normalize_base_url(cfg.base_url), model=cfg.model,
         temperature=0.3, timeout=180, max_retries=2,

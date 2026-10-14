@@ -3,8 +3,9 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import {
   ALL_SECTIONS, LIST_KEYS, emptyCV, emptyProfile, emptyTarget, newId,
-  type CV, type Item, type LLMConfig, type Profile,
+  type CV, type Item, type LLMConfig, type Profile, type ServerConfig,
 } from "./types";
+import { api, setApiToken } from "./api";
 
 export type Step = "connect" | "scrape" | "edit" | "ai" | "export";
 
@@ -22,6 +23,11 @@ interface Store {
   lastCheckpoint: string | null;
   llm: LLMConfig;
   setLlm: (llm: LLMConfig) => void;
+  server: ServerConfig | null;
+  token: string;
+  setToken: (token: string) => void;
+  /** An LLM is usable: key typed in the UI, or a default key in the server .env. */
+  aiReady: boolean;
   step: Step;
   setStep: (s: Step) => void;
   jobId: string;
@@ -31,6 +37,7 @@ interface Store {
 const Ctx = createContext<Store | null>(null);
 const CV_KEY = "cv-ats:cv";
 const LLM_KEY = "cv-ats:llm";
+const TOKEN_KEY = "passefiltre:token";
 const MAX_HISTORY = 25;
 
 /** Accepts a scraped profile, a saved CV, or partial JSON and returns a complete CV. */
@@ -77,6 +84,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [step, setStep] = useState<Step>("connect");
   const [jobId, setJobId] = useState("");
   const [ready, setReady] = useState(false);
+  const [server, setServer] = useState<ServerConfig | null>(null);
+  const [token, setTokenState] = useState("");
 
   useEffect(() => {
     const savedCv = load<CV>(() => localStorage, CV_KEY);
@@ -84,12 +93,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // The API key stays in sessionStorage: forgotten when the tab is closed.
     const savedLlm = load<LLMConfig>(() => sessionStorage, LLM_KEY);
     if (savedLlm) setLlmState(savedLlm);
+    const savedToken = load<string>(() => sessionStorage, TOKEN_KEY);
+    if (savedToken) {
+      setApiToken(savedToken);
+      setTokenState(savedToken);
+    }
     setReady(true);
+    api.config().then(setServer).catch(() => setServer(null)); // backend down: handled where it matters
   }, []);
 
   useEffect(() => {
     if (ready) save(() => localStorage, CV_KEY, cv);
   }, [cv, ready]);
+
+  const setToken = (v: string) => {
+    setApiToken(v);
+    setTokenState(v);
+    save(() => sessionStorage, TOKEN_KEY, v); // forgotten when the tab is closed
+  };
 
   const setLlm = (v: LLMConfig) => {
     setLlmState(v);
@@ -112,7 +133,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     <Ctx.Provider
       value={{
         cv, update: setCv, checkpoint, undo, lastCheckpoint: history.at(-1)?.label ?? null,
-        llm, setLlm, step, setStep, jobId, setJobId,
+        llm, setLlm, server, token, setToken, aiReady: Boolean(llm.api_key.trim() || server?.llm.server_key),
+        step, setStep, jobId, setJobId,
       }}
     >
       {children}

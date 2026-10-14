@@ -297,7 +297,7 @@ function ListCard({ sectionKey }: { sectionKey: ListKey }) {
 /* ------------------------------------------------------------------ step */
 
 export function EditStep() {
-  const { cv, setStep, llm } = useStore();
+  const { cv, setStep, aiReady } = useStore();
   const { setItems } = useCvActions();
   const enabled = cv.settings.sections;
   // Enabled sections in CV order, then the hidden ones. Empty lists are folded into one "add" row.
@@ -313,7 +313,7 @@ export function EditStep() {
             Ce qui est <span className="marked text-ink">surligné</span> apparaît dans le CV. L&apos;aperçu et le score se mettent à jour en direct.
           </p>
         </div>
-        {llm.api_key ? (
+        {aiReady ? (
           <Button variant="ai" onClick={() => setStep("ai")}>
             <Sparkles className="size-4" aria-hidden /> Améliorer avec l&apos;agent IA
           </Button>

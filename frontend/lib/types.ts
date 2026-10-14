@@ -73,6 +73,13 @@ export interface LLMConfig {
   model: string;
 }
 
+/** Server-side defaults (from the root .env). The API key itself is never sent to the browser. */
+export interface ServerConfig {
+  llm: { server_key: boolean; base_url: string; model: string };
+  docker: boolean;
+  auth_required: boolean;
+}
+
 export interface Job<R = Profile> {
   id: string;
   status: "running" | "needs_code" | "done" | "error";
