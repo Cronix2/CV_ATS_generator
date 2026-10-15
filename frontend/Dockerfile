@@ -1,5 +1,5 @@
 # PasseFiltre web app (Next.js, standalone output).
-FROM node:22-alpine AS build
+FROM node:25-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -11,7 +11,7 @@ ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
     NEXT_TELEMETRY_DISABLED=1
 RUN node node_modules/next/dist/bin/next build
 
-FROM node:22-alpine
+FROM node:25-alpine
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 HOSTNAME=0.0.0.0 PORT=3000
 COPY --from=build /app/.next/standalone ./
