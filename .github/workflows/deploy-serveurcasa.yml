@@ -106,7 +106,7 @@ jobs:
       SHA: ${{ github.event.workflow_run.head_sha }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # Compose files matching the images we just built.
+      # Compose files matching the images we just built (staged under the deploy lock below).
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
@@ -116,14 +116,28 @@ jobs:
       - name: Verify commit is still the tip of main
         id: freshness
         run: |
-          set -euo pipefail
-          latest="$(curl -fsSL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/main" \
-            | grep -m1 '"sha"' | sed -E 's/.*"sha": *"([0-9a-f]+)".*/\1/')"
-          if [ -z "${latest}" ]; then
-            echo "::error::Could not resolve the current HEAD of main."; exit 1
+          set -uo pipefail
+
+          # Reliable HEAD-of-main resolver: no `grep -m1 | sed` pipeline (which can SIGPIPE
+          # under pipefail and fail intermittently). Prefer `gh api --jq`, fall back to
+          # downloading the full JSON then parsing it with Python. Returns non-zero on any
+          # network or parse error so the caller can stop safely.
+          main_head() {
+            if command -v gh >/dev/null 2>&1; then
+              gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha'
+              return
+            fi
+            local body
+            body="$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/main")" || return 1
+            printf '%s' "${body}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
+          }
+
+          if ! latest="$(main_head)" || ! [[ "${latest}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve the current HEAD of main (network error or invalid response). Aborting without any change."
+            exit 1
           fi
           if [ "${latest}" != "${SHA}" ]; then
             echo "::notice::Commit ${SHA} is no longer the tip of main (now ${latest}); a newer deploy will handle it. Skipping."
@@ -141,13 +155,6 @@ jobs:
           test -f "${DEPLOY_DIR}/.env" || { echo "::error::${DEPLOY_DIR}/.env is missing (create it from .env.example)."; exit 1; }
           command -v docker >/dev/null || { echo "::error::docker not found on the runner."; exit 1; }
           docker compose version >/dev/null || { echo "::error::docker compose plugin not available."; exit 1; }
-
-      - name: Stage Compose files
-        if: steps.freshness.outputs.stale != 'true'
-        run: |
-          set -euo pipefail
-          install -m 0644 docker-compose.yml        "${DEPLOY_DIR}/docker-compose.yml"
-          install -m 0644 docker-compose.server.yml "${DEPLOY_DIR}/docker-compose.server.yml"
 
       - name: Log in to GHCR
         if: steps.freshness.outputs.stale != 'true'
@@ -170,9 +177,15 @@ jobs:
           compose() { docker compose -p passefiltre -f docker-compose.yml -f docker-compose.server.yml --env-file .env --env-file deploy.env "$@"; }
 
           main_head() {
-            curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/main" \
-              | grep -m1 '"sha"' | sed -E 's/.*"sha": *"([0-9a-f]+)".*/\1/'
+            # Same reliable resolver as the freshness step (no SIGPIPE-prone pipeline).
+            if command -v gh >/dev/null 2>&1; then
+              gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha'
+              return
+            fi
+            local body
+            body="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/main")" || return 1
+            printf '%s' "${body}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
           }
 
           health_ok() {
@@ -190,9 +203,10 @@ jobs:
             return 1
           }
 
-          # Roll back to the last version that passed EVERY health check (deploy.env.last-good),
-          # never merely to the previous attempt. Rollback errors are reported, never swallowed,
-          # and both API and frontend must be healthy before a rollback is called a success.
+          # Only used once `compose up` has started (containers may have changed). Rolls back to
+          # the last version that passed EVERY health check (deploy.env.last-good), never merely
+          # to the previous attempt. Rollback errors are reported, never swallowed, and both API
+          # and frontend must be healthy before a rollback is called a success.
           rollback() {
             echo "::error::Deployment of ${NEW_TAG} failed."
             if [ -f deploy.env.last-good ]; then
@@ -204,7 +218,7 @@ jobs:
                 echo "::error::Rollback FAILED (API or frontend still unhealthy) — manual intervention required."
               fi
             else
-              echo "::error::No known-good version recorded; cannot roll back. Containers left unchanged."
+              echo "::error::No known-good version recorded (first deploy?); automatic rollback impossible — manual intervention required."
             fi
             exit 1
           }
@@ -217,24 +231,43 @@ jobs:
             exit 1
           fi
 
+          # Snapshot deploy.env as it is now (= what the running containers use), so any abort
+          # BEFORE `compose up` restores it exactly, even on a first deploy (no last-good yet).
+          HAD_ENV=0; ORIG_ENV=""
+          if [ -f deploy.env ]; then HAD_ENV=1; ORIG_ENV="$(cat deploy.env)"; fi
+          restore_env() {
+            if [ "${HAD_ENV}" = 1 ]; then printf '%s\n' "${ORIG_ENV}" > deploy.env; else rm -f deploy.env; fi
+          }
+          # Failure before `compose up`: containers were never touched, so NO rollback — just
+          # restore deploy.env and fail the job.
+          abort_before_up() {
+            echo "::error::$1 Running containers were NOT modified."
+            restore_env
+            exit 1
+          }
+
+          # Stage the Compose files of this commit under the lock.
+          install -m 0644 "${GITHUB_WORKSPACE}/docker-compose.yml"        docker-compose.yml \
+            || abort_before_up "Could not stage docker-compose.yml."
+          install -m 0644 "${GITHUB_WORKSPACE}/docker-compose.server.yml" docker-compose.server.yml \
+            || abort_before_up "Could not stage docker-compose.server.yml."
+
           echo "Pulling images ${NEW_TAG}..."
           printf 'PASSEFILTRE_IMAGE_TAG=%s\n' "${NEW_TAG}" > deploy.env
-          compose pull || rollback
+          compose pull || abort_before_up "Pull of ${NEW_TAG} failed."
 
           echo "Validating merged Compose configuration..."
-          compose config -q || rollback
+          compose config -q || abort_before_up "Invalid Compose configuration."
 
           # Re-check HEAD of main *immediately* before changing containers: a newer commit may
-          # have landed while the arm64 images were building and pulling. If so, step aside
-          # WITHOUT touching the running containers (a newer deploy will take over).
-          LATEST="$(main_head)"
-          if [ -z "${LATEST}" ]; then
-            echo "::error::Could not resolve HEAD of main before updating containers."
-            rollback
+          # have landed while the arm64 images were building and pulling. A failed/invalid HEAD
+          # lookup stops the deploy SAFELY: running containers untouched, no rollback.
+          if ! LATEST="$(main_head)" || ! [[ "${LATEST}" =~ ^[0-9a-f]{40}$ ]]; then
+            abort_before_up "Could not resolve HEAD of main before updating containers (network error or invalid response)."
           fi
           if [ "${LATEST}" != "${SHA}" ]; then
             echo "::notice::main advanced to ${LATEST}; a newer deploy will take over. Containers left unchanged."
-            if [ -f deploy.env.last-good ]; then cp -f deploy.env.last-good deploy.env; fi
+            restore_env
             exit 0
           fi
 

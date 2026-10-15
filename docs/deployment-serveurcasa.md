@@ -162,8 +162,15 @@ pf() { docker compose -p passefiltre -f docker-compose.yml -f docker-compose.ser
 
 ### Automatique
 
-Si un `pull`, le `up -d`, un healthcheck API **ou** un healthcheck frontend
-échoue, le job :
+**Échec avant `compose up`** (copie des fichiers Compose, `pull`, `config`,
+HEAD de `main` introuvable ou réponse invalide) : les conteneurs en cours
+d'exécution ne sont **pas touchés**, aucun rollback n'est lancé, `deploy.env`
+est restauré tel qu'il était avant le déploiement et le job **échoue**. Si
+`main` a simplement avancé, le job s'arrête proprement (succès) avec la même
+restauration.
+
+**Échec à partir de `compose up`** (`up -d`, healthcheck API **ou** frontend),
+le job :
 
 1. restaure le **dernier déploiement ayant passé TOUS les healthchecks**,
    enregistré dans `deploy.env.last-good` (jamais une simple tentative
@@ -210,11 +217,15 @@ ce n'est **pas** une référence cryptographiquement immuable :
   Il est **immuable par construction** : le même digest renvoie toujours
   exactement les mêmes octets, impossible à ré-associer à un autre contenu.
 
-Pour un déploiement strictement reproductible, pointer sur un digest plutôt que
-sur un tag. `PASSEFILTRE_IMAGE_TAG` accepte les deux formes grâce à la
-référence `image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG}` —
-il suffit d'y mettre une valeur commençant par `@sha256:` (ou d'adapter la
-référence). Récupérer le digest publié :
+**Cette première version utilise uniquement des tags `sha-<commit>`** (choix de
+simplicité). `PASSEFILTRE_IMAGE_TAG` ne contient donc qu'un tag : la référence
+`image: …:${PASSEFILTRE_IMAGE_TAG}` n'accepte pas une valeur `@sha256:…`
+directement (la forme serait `image: …@sha256:…`, incompatible avec `:${VAR}`).
+Un pinning par digest demanderait de changer la forme de la référence d'image
+dans `docker-compose.server.yml` : ce n'est pas fait ici.
+
+En attendant, le digest réellement publié reste **vérifiable manuellement** pour
+tracer précisément ce qui tourne :
 
 ```bash
 # digest de l'image arm64 publiée pour un commit donné
