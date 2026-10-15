@@ -96,6 +96,10 @@ Par défaut, PasseFiltre n'est joignable que depuis la machine qui le lance. Pou
 - **Garde-fou** : dès que la configuration expose l'API au réseau (`SITE_ADDRESS`, `ALLOWED_HOSTS`, `BIND_ADDRESS`, `BACKEND_HOST` ou une `NEXT_PUBLIC_API_URL` non locale), l'API **refuse de démarrer** sans `PASSEFILTRE_TOKEN` d'au moins 32 caractères.
 - Sans Docker, l'équivalent est `BACKEND_HOST` / `FRONTEND_HOST` + les mêmes variables, derrière votre propre reverse proxy HTTPS.
 
+### Déploiement continu (self-hosted)
+
+Un déploiement continu vers un serveur ARM64 (Raspberry Pi) est décrit dans [docs/deployment-serveurcasa.md](docs/deployment-serveurcasa.md) : chaque push sur `main` validé par la CI construit les images `linux/arm64`, les publie sur GHCR et met à jour le serveur automatiquement (healthchecks + rollback, données persistantes préservées).
+
 ## Sécurité
 
 - **Accès** : écoute sur `127.0.0.1` par défaut (lanceur et Docker). Jeton `PASSEFILTRE_TOKEN` (obligatoire en réseau), contrôle de l'en-tête `Host` (DNS rebinding), requêtes cross-site refusées (vérification de `Origin` et `Content-Type: application/json` exigé sur les POST, donc pas de POST « simple » sans preflight CORS).

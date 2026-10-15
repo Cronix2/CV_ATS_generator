@@ -1,0 +1,220 @@
+# Continuous Deployment to ServeurCasa (Raspberry Pi 5, linux/arm64).
+#
+# Flow:
+#   push to main  ->  CI workflow (ci.yml)  ->  [this workflow, only if CI succeeded]
+#     1. build  : GitHub-hosted runner cross-builds arm64 images and pushes them to GHCR,
+#                 tagged with the exact commit SHA that CI validated.
+#     2. deploy : the self-hosted arm64 runner on ServeurCasa pulls those images and
+#                 updates ONLY the `passefiltre` Compose project, with health-check + rollback.
+#
+# Security model:
+#   - Triggered via `workflow_run`, so this workflow (and its secrets) always runs from the
+#     version on the default branch, never from untrusted pull-request code.
+#   - Guards ensure it only runs for a *successful push to main* (never for pull requests).
+#   - Least-privilege GITHUB_TOKEN; no long-lived credentials; images pinned by immutable SHA tag.
+#   - A freshness check prevents an older run from overwriting a newer commit already on main.
+name: Deploy to ServeurCasa
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+# Nothing by default; each job requests only what it needs.
+permissions: {}
+
+# One deployment at a time. Combined with the freshness check in the deploy job, this
+# prevents concurrent deploys and stops a slow/old run from clobbering a newer one.
+concurrency:
+  group: deploy-serveurcasa
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & push arm64 images
+    runs-on: ubuntu-latest
+    # Only for a CI run that SUCCEEDED, that was a push (not a pull_request), on main.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: api
+            context: backend
+            build_args: ""
+          - name: web
+            context: frontend
+            # Baked into the Next.js build: the browser calls the API at this LAN address.
+            build_args: |
+              NEXT_PUBLIC_API_URL=${{ vars.SERVEURCASA_API_URL || 'http://192.168.1.63:8100' }}
+    steps:
+      # Build the Dockerfile exactly as it was at the commit CI validated.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          build-args: ${{ matrix.build_args }}
+          # Immutable, commit-pinned tag + a convenience `main` tag.
+          tags: |
+            ghcr.io/cronix2/passefiltre-${{ matrix.name }}:sha-${{ github.event.workflow_run.head_sha }}
+            ghcr.io/cronix2/passefiltre-${{ matrix.name }}:main
+          # Dedicated arm64 cache scope: never mixes with the amd64 CI/release caches.
+          cache-from: type=gha,scope=${{ matrix.name }}-arm64
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}-arm64
+
+  deploy:
+    name: Deploy on ServeurCasa
+    needs: build
+    runs-on: [self-hosted, Linux, ARM64]
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    permissions:
+      contents: read
+      packages: read    # pull from ghcr.io
+    env:
+      DEPLOY_DIR: /opt/passefiltre
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # Compose files matching the images we just built.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      # Refuse to deploy a commit that is no longer the tip of main (a newer push won the race).
+      - name: Verify commit is still the tip of main
+        id: freshness
+        run: |
+          set -euo pipefail
+          latest="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/main" \
+            | grep -m1 '"sha"' | sed -E 's/.*"sha": *"([0-9a-f]+)".*/\1/')"
+          if [ -z "${latest}" ]; then
+            echo "::error::Could not resolve the current HEAD of main."; exit 1
+          fi
+          if [ "${latest}" != "${SHA}" ]; then
+            echo "::notice::Commit ${SHA} is no longer the tip of main (now ${latest}); a newer deploy will handle it. Skipping."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check deployment prerequisites
+        if: steps.freshness.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          test -d "${DEPLOY_DIR}" || { echo "::error::${DEPLOY_DIR} is missing on the server."; exit 1; }
+          # Confirm the private .env exists WITHOUT reading or printing it.
+          test -f "${DEPLOY_DIR}/.env" || { echo "::error::${DEPLOY_DIR}/.env is missing (create it from .env.example)."; exit 1; }
+          command -v docker >/dev/null || { echo "::error::docker not found on the runner."; exit 1; }
+          docker compose version >/dev/null || { echo "::error::docker compose plugin not available."; exit 1; }
+
+      - name: Stage Compose files
+        if: steps.freshness.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          install -m 0644 docker-compose.yml        "${DEPLOY_DIR}/docker-compose.yml"
+          install -m 0644 docker-compose.server.yml "${DEPLOY_DIR}/docker-compose.server.yml"
+
+      - name: Log in to GHCR
+        if: steps.freshness.outputs.stale != 'true'
+        run: echo "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Deploy, health-check and rollback on failure
+        if: steps.freshness.outputs.stale != 'true'
+        run: |
+          set -uo pipefail
+          cd "${DEPLOY_DIR}"
+
+          NEW_TAG="sha-${SHA}"
+
+          # Read only the non-secret values we need; never touch PASSEFILTRE_TOKEN.
+          get_env() { grep -E "^$1=" .env | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" ; }
+          BIND="$(get_env BIND_ADDRESS)";  BIND="${BIND:-192.168.1.63}"
+          BPORT="$(get_env BACKEND_PORT)"; BPORT="${BPORT:-8100}"
+          FPORT="$(get_env FRONTEND_PORT)"; FPORT="${FPORT:-3101}"
+
+          compose() { docker compose -p passefiltre -f docker-compose.yml -f docker-compose.server.yml --env-file .env --env-file deploy.env "$@"; }
+
+          health_ok() {
+            for _ in $(seq 1 60); do
+              if curl -fsS -o /dev/null "http://${BIND}:${BPORT}/api/health"; then return 0; fi
+              sleep 5
+            done
+            return 1
+          }
+          frontend_ok() {
+            for _ in $(seq 1 24); do
+              if curl -fsS -o /dev/null "http://${BIND}:${FPORT}/"; then return 0; fi
+              sleep 5
+            done
+            return 1
+          }
+
+          # Remember the currently deployed tag so we can roll back to it.
+          if [ -f deploy.env ]; then cp -f deploy.env deploy.env.previous; fi
+          printf 'PASSEFILTRE_IMAGE_TAG=%s\n' "${NEW_TAG}" > deploy.env
+
+          rollback() {
+            echo "::error::Deployment of ${NEW_TAG} failed."
+            if [ -f deploy.env.previous ]; then
+              echo "Rolling back to the previous version..."
+              cp -f deploy.env.previous deploy.env
+              compose pull || true
+              compose up -d || true
+              if health_ok; then
+                echo "::warning::Rolled back to the previous working version."
+              else
+                echo "::error::Rollback health check also failed — manual intervention required."
+              fi
+            else
+              echo "::error::No previous version recorded; cannot roll back. Containers left as-is."
+            fi
+            exit 1
+          }
+
+          echo "Pulling images ${NEW_TAG}..."
+          compose pull || rollback
+
+          echo "Validating merged Compose configuration..."
+          compose config -q || rollback
+
+          echo "Updating the passefiltre containers..."
+          compose up -d --remove-orphans || rollback
+
+          echo "Waiting for the API /api/health ..."
+          health_ok   || rollback
+          echo "Waiting for the frontend ..."
+          frontend_ok || rollback
+
+          echo "::notice::PasseFiltre is live on http://${BIND}:${FPORT} (API http://${BIND}:${BPORT}) — ${NEW_TAG}."
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io || true
