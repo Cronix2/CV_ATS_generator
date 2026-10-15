@@ -126,7 +126,7 @@ uv pip compile requirements-dev.txt --universal --python-version 3.10 --generate
 
 ## CI / CD
 
-- **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) : à chaque push et pull request, tests du backend, vérification des types et build du frontend, construction des deux images Docker.
+- **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) : à chaque push et pull request, tests du backend, vérification des types et build du frontend, construction des deux images Docker, puis **démarrage réel de Chromium** dans l'image API (amd64 et arm64 natif) via `python -m app.scraper.browser_check`.
 - **CD** ([`.github/workflows/release.yml`](.github/workflows/release.yml)) : un tag `v*` publie les images `ghcr.io/cronix2/passefiltre-api` et `passefiltre-web` sur GitHub Container Registry et crée une release avec les instructions d'installation.
 
 ```bash

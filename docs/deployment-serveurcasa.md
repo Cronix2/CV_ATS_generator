@@ -29,6 +29,9 @@ push sur main
 - La compilation des images se fait **sur GitHub**, jamais sur le Raspberry Pi.
 - Le Pi ne fait que *télécharger* des images `arm64` déjà construites et
   redémarrer les conteneurs du projet `passefiltre`.
+- Avant le déploiement, Chromium est **réellement démarré** dans l'image API
+  sur un runner GitHub ARM64 natif (job `smoke`), puis sur le Pi avant
+  `compose up` (voir §12).
 
 ### Fichiers concernés
 
@@ -356,6 +359,17 @@ Si les images sont **privées** et que le pull échoue sur le runner
 - Sur le Pi, `docker image inspect ghcr.io/cronix2/passefiltre-api:sha-<commit>
   --format '{{.Architecture}}'` doit renvoyer `arm64`.
 
+### `Executable doesn't exist at /ms-playwright/chromium-XXXX/...`
+
+Le Chromium attendu par Patchright n'est pas dans l'image : voir §12. Ne
+**pas** installer de navigateur à la main sur le serveur ; corriger le
+`Dockerfile` et laisser la CI reconstruire l'image. Diagnostic sans rien
+modifier :
+
+```bash
+pf run --rm --no-deps -T api python -m app.scraper.browser_check
+```
+
 ### `!reset` non reconnu
 
 Erreur du type *"unknown tag !reset"* → la version de Docker Compose est
@@ -394,5 +408,81 @@ Le workflow de déploiement **ne touche jamais** aux autres services du serveur 
 - `-p passefiltre` cantonne toutes les commandes au projet `passefiltre`.
 - Aucun `docker system prune`, `docker volume prune`, ni `compose down -v`.
 - Les volumes persistants (`passefiltre_sessions`) ne sont jamais supprimés.
+
+## 12. Navigateur Chromium du scraping (Patchright)
+
+### Symptôme
+
+Frontend et API opérationnels, `/api/health` en 200, mais le scraping LinkedIn
+échouait au démarrage du navigateur :
+
+```
+BrowserType.launch_persistent_context: Executable doesn't exist at
+/ms-playwright/chromium-1243/chrome-linux-arm64/chrome
+```
+
+alors que `/ms-playwright` contenait `chromium-1248`.
+
+### Cause
+
+- Scrapling 0.4.15 dépend **à la fois** de `playwright` et de `patchright`
+  (`playwright>=1.62.0`, `patchright>=1.62.1`, non alignés entre eux). Le lock
+  a résolu `playwright==1.64.0` et `patchright==1.63.0`.
+- Chaque bibliothèque embarque son propre pilote et sa propre révision de
+  Chromium (`driver/package/browsers.json`) : **Playwright 1.64.0 → 1248**,
+  **Patchright 1.63.0 → 1243**. Les deux lisent le même
+  `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`.
+- `StealthySession` (le scraper LinkedIn) lance Chromium via **Patchright**
+  (`scrapling/engines/_browsers/_stealth.py` : `from patchright.sync_api import
+  sync_playwright`). Playwright n'y sert qu'aux types Python.
+- Le `Dockerfile` installait le navigateur avec `python -m playwright install`
+  (comme la commande `scrapling install`), donc la révision 1248 de
+  Playwright, jamais la 1243 attendue par Patchright. Le problème n'est pas
+  propre à ARM64 : les deux pilotes supportent `debian13-arm64` et
+  `chrome-linux-arm64` ; c'est un décalage de versions, qui touchait aussi
+  amd64 et le lanceur local (`npm run setup`).
+
+### Correction
+
+- `backend/Dockerfile` : `python -m patchright install --with-deps chromium`.
+  Le navigateur est installé par le CLI du pilote réellement utilisé : sa
+  révision suit **automatiquement** la version verrouillée de Patchright,
+  y compris lors des futures mises à jour Dependabot. Les versions
+  verrouillées ne changent pas. Le Chromium de Playwright, inutile, n'est plus
+  installé (image plus légère). Si un jour `DynamicSession`/`DynamicFetcher`
+  (pilote Playwright) était utilisé, il faudrait aussi
+  `python -m playwright install chromium`.
+- Toujours dans le `Dockerfile`, après `USER app` :
+  `python -m app.scraper.browser_check --static` fait **échouer le build** si
+  l'exécutable attendu par Patchright est absent (sans lancer le navigateur,
+  donc compatible avec le build sous QEMU).
+- `scripts/passefiltre.mjs` (`npm run setup`) : même correction en local.
+- Sécurité inchangée : utilisateur non-root `uid 10001`,
+  `no-new-privileges`, `shm_size: 1gb`, dépendances vérifiées par hash.
+
+### Tests de démarrage réel du navigateur
+
+`python -m app.scraper.browser_check` (dans l'image) affiche l'architecture et
+les versions, vérifie l'exécutable attendu par Patchright, puis **démarre
+Chromium via `StealthySession`** (profil persistant temporaire, comme le
+scraper) et charge une page servie sur `127.0.0.1` (aucun accès réseau
+externe). Code de sortie non nul en cas d'échec.
+
+| Où | Quand | Image testée |
+| --- | --- | --- |
+| `ci.yml`, job `docker` (amd64) | chaque PR / push | image construite par la CI |
+| `ci.yml`, job `docker-arm64` (`ubuntu-24.04-arm`, ARM64 natif) | chaque PR / push | image arm64 construite nativement |
+| `deploy-serveurcasa.yml`, job `smoke` (`ubuntu-24.04-arm`) | avant `deploy` | **l'image exacte** `sha-<commit>` poussée sur GHCR |
+| `deploy-serveurcasa.yml`, job `deploy` (sur le Pi) | avant `compose up` | même image, noyau du Pi, options du service (`compose run --rm --no-deps`) |
+
+Un échec de `smoke` empêche le job `deploy` de démarrer. Un échec sur le Pi
+arrête le déploiement **avant** de toucher aux conteneurs (`deploy.env`
+restauré, pas de rollback nécessaire). Le conteneur de test est éphémère
+(`--rm`) et appartient au projet `passefiltre` : aucun autre service Docker
+n'est concerné.
+
+Les runners `ubuntu-24.04-arm` sont gratuits pour les dépôts publics. Si le
+dépôt devenait privé, il faudrait un runner ARM64 payant, ou se contenter du
+test exécuté sur le Pi.
 - Aucune modification des services `restic-serveurcasa.*` ni des montages
   `/mnt/storageplex` et `/mnt/backup8to`.

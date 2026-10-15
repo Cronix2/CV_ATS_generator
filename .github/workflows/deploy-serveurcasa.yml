@@ -4,8 +4,11 @@
 #   push to main  ->  CI workflow (ci.yml)  ->  [this workflow, only if CI succeeded]
 #     1. build  : GitHub-hosted runner cross-builds arm64 images and pushes them to GHCR,
 #                 tagged with the exact commit SHA that CI validated.
-#     2. deploy : the self-hosted arm64 runner on ServeurCasa pulls those images and
-#                 updates ONLY the `passefiltre` Compose project, with health-check + rollback.
+#     2. smoke  : a GitHub-hosted NATIVE arm64 runner pulls that exact API image and really starts
+#                 Chromium in it (Patchright / StealthySession). No deploy if the browser fails.
+#     3. deploy : the self-hosted arm64 runner on ServeurCasa pulls those images, repeats the
+#                 browser test on the Pi (before touching containers), then updates ONLY the
+#                 `passefiltre` Compose project, with health-check + rollback.
 #
 # Security model:
 #   - Triggered via `workflow_run`, so this workflow (and its secrets) always runs from the
@@ -101,9 +104,37 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.name }}-arm64
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}-arm64
 
+  # The image above was cross-built under QEMU: prove on real arm64 hardware that the browser the
+  # scraper needs is present AND starts, before anything reaches the server.
+  smoke:
+    name: Browser smoke test (arm64)
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    permissions:
+      packages: read    # pull from ghcr.io
+    env:
+      IMAGE: ghcr.io/cronix2/passefiltre-api:sha-${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Start Chromium through StealthySession in the exact image to deploy
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          docker pull --platform linux/arm64 "${IMAGE}"
+          docker run --rm --platform linux/arm64 --shm-size=1g --security-opt no-new-privileges:true \
+            "${IMAGE}" python -m app.scraper.browser_check
+
   deploy:
     name: Deploy on ServeurCasa
-    needs: build
+    needs: [build, smoke]
     # The `passefiltre` label pins this to the dedicated runner, so another ARM64 self-hosted
     # runner (another repo/project) can never pick up this deployment job.
     runs-on: [self-hosted, Linux, ARM64, passefiltre]
@@ -305,6 +336,12 @@ jobs:
 
           echo "Validating merged Compose configuration..."
           compose config -q || abort_before_up "Invalid Compose configuration."
+
+          # Real browser start on THIS machine (Pi kernel, same shm/security options as the service),
+          # in a one-off container: the running containers are not touched.
+          echo "Browser smoke test of ${NEW_TAG} on ServeurCasa..."
+          compose run --rm --no-deps -T api python -m app.scraper.browser_check \
+            || abort_before_up "Chromium does not start in ${NEW_TAG} on ServeurCasa (browser smoke test)."
 
           # Re-check HEAD of main *immediately* before changing containers: a newer commit may
           # have landed while the arm64 images were building and pulling. A failed/invalid HEAD

@@ -80,10 +80,11 @@ function setup() {
   run(VENV_PY, ["-m", "pip", "install", "--quiet", "--require-hashes", "-r", "requirements-dev.lock"], BACKEND);
 
   step("Navigateur Chromium utilisé par Scrapling");
-  run(VENV_PY, ["-m", "playwright", "install", "chromium"], BACKEND);
+  // StealthySession launches Chromium through patchright (not playwright): install patchright's revision.
+  run(VENV_PY, ["-m", "patchright", "install", "chromium"], BACKEND);
   if (process.platform === "linux") {
-    if (process.getuid?.() === 0) run(VENV_PY, ["-m", "playwright", "install-deps", "chromium"], BACKEND);
-    else console.log(dim(`  Si Chromium refuse de démarrer, installez ses bibliothèques système :\n  sudo ${VENV_PY} -m playwright install-deps chromium`));
+    if (process.getuid?.() === 0) run(VENV_PY, ["-m", "patchright", "install-deps", "chromium"], BACKEND);
+    else console.log(dim(`  Si Chromium refuse de démarrer, installez ses bibliothèques système :\n  sudo ${VENV_PY} -m patchright install-deps chromium`));
   }
 
   step("Frontend : dépendances npm");
