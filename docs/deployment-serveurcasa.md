@@ -180,8 +180,15 @@ le job :
 3. **échoue explicitement** le job pour signaler le problème.
 
 Le fichier `deploy.env.last-good` n'est mis à jour qu'après un déploiement
-entièrement sain : c'est la cible de rollback garantie fonctionnelle. Le volume
-des sessions LinkedIn n'est jamais supprimé.
+entièrement sain : c'est la cible de rollback garantie fonctionnelle. Les
+fichiers de suivi (`deploy.env`, `deploy.env.last-good`) sont écrits de façon
+atomique (fichier temporaire + renommage) puis relus. Si `deploy.env.last-good`
+ne peut pas être enregistré, le job **échoue** : la nouvelle version tourne mais
+n'est **pas** considérée comme validée (l'ancienne référence reste intacte).
+Corriger le problème (droits, espace disque) puis relancer le workflow. Un
+`deploy.env.last-good` illisible ou au contenu inattendu bloque le rollback
+automatique avec une erreur explicite. Le volume des sessions LinkedIn n'est
+jamais supprimé.
 
 ### Manuel
 

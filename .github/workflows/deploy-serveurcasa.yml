@@ -153,6 +153,8 @@ jobs:
           test -d "${DEPLOY_DIR}" || { echo "::error::${DEPLOY_DIR} is missing on the server."; exit 1; }
           # Confirm the private .env exists WITHOUT reading or printing it.
           test -f "${DEPLOY_DIR}/.env" || { echo "::error::${DEPLOY_DIR}/.env is missing (create it from .env.example)."; exit 1; }
+          test -r "${DEPLOY_DIR}/.env" || { echo "::error::${DEPLOY_DIR}/.env is not readable by the runner user."; exit 1; }
+          test -w "${DEPLOY_DIR}" || { echo "::error::${DEPLOY_DIR} is not writable by the runner user (tracking files)."; exit 1; }
           command -v docker >/dev/null || { echo "::error::docker not found on the runner."; exit 1; }
           docker compose version >/dev/null || { echo "::error::docker compose plugin not available."; exit 1; }
 
@@ -164,7 +166,7 @@ jobs:
         if: steps.freshness.outputs.stale != 'true'
         run: |
           set -uo pipefail
-          cd "${DEPLOY_DIR}"
+          cd "${DEPLOY_DIR}" || { echo "::error::Cannot enter ${DEPLOY_DIR}."; exit 1; }
 
           NEW_TAG="sha-${SHA}"
 
@@ -203,29 +205,57 @@ jobs:
             return 1
           }
 
+          # Tracking files (deploy.env, deploy.env.last-good) are written atomically (temp file +
+          # rename, so a failed write never leaves a truncated file) and read back to verify.
+          write_tracking() {  # $1 = file, $2 = content
+            local tmp="$1.tmp.$$"
+            if printf '%s\n' "$2" > "${tmp}" && mv -f "${tmp}" "$1" && [ "$(cat "$1")" = "$2" ]; then
+              return 0
+            fi
+            rm -f "${tmp}"
+            echo "::error::Could not write deployment tracking file $1."
+            return 1
+          }
+          # Prints the content of a tracking file, only if readable and holding exactly one
+          # commit-pinned tag line.
+          read_tracking() {  # $1 = file
+            local c
+            c="$(cat "$1")" || { echo "::error::Could not read $1." >&2; return 1; }
+            [[ "${c}" =~ ^PASSEFILTRE_IMAGE_TAG=sha-[0-9a-f]{40}$ ]] \
+              || { echo "::error::$1 has unexpected content." >&2; return 1; }
+            printf '%s' "${c}"
+          }
+
           # Only used once `compose up` has started (containers may have changed). Rolls back to
           # the last version that passed EVERY health check (deploy.env.last-good), never merely
           # to the previous attempt. Rollback errors are reported, never swallowed, and both API
           # and frontend must be healthy before a rollback is called a success.
           rollback() {
+            local good
             echo "::error::Deployment of ${NEW_TAG} failed."
-            if [ -f deploy.env.last-good ]; then
-              echo "Rolling back to the last known-good version ($(cat deploy.env.last-good))..."
-              cp -f deploy.env.last-good deploy.env
+            if [ ! -e deploy.env.last-good ]; then
+              echo "::error::No known-good version recorded (first deploy?); automatic rollback impossible — manual intervention required."
+            elif ! good="$(read_tracking deploy.env.last-good)"; then
+              echo "::error::Rollback impossible: deploy.env.last-good is unreadable or invalid — manual intervention required."
+            elif ! write_tracking deploy.env "${good}"; then
+              echo "::error::Rollback impossible: deploy.env could not be written — manual intervention required."
+            else
+              echo "Rolling back to the last known-good version (${good#PASSEFILTRE_IMAGE_TAG=})..."
               if compose pull && compose up -d && health_ok && frontend_ok; then
                 echo "::warning::Rolled back to the last known-good version (API + frontend healthy)."
               else
                 echo "::error::Rollback FAILED (API or frontend still unhealthy) — manual intervention required."
               fi
-            else
-              echo "::error::No known-good version recorded (first deploy?); automatic rollback impossible — manual intervention required."
             fi
             exit 1
           }
 
           # Serialize deployments on the server: no two runs may touch the containers at once,
           # even if something outside this workflow triggers a parallel deploy.
-          exec 9>".deploy.lock"
+          if ! exec 9>".deploy.lock"; then
+            echo "::error::Cannot open the deployment lock file ${DEPLOY_DIR}/.deploy.lock."
+            exit 1
+          fi
           if ! flock -w 600 9; then
             echo "::error::Could not acquire the deployment lock within 10 min (another deploy running?)."
             exit 1
@@ -234,15 +264,18 @@ jobs:
           # Snapshot deploy.env as it is now (= what the running containers use), so any abort
           # BEFORE `compose up` restores it exactly, even on a first deploy (no last-good yet).
           HAD_ENV=0; ORIG_ENV=""
-          if [ -f deploy.env ]; then HAD_ENV=1; ORIG_ENV="$(cat deploy.env)"; fi
+          if [ -e deploy.env ]; then
+            HAD_ENV=1
+            ORIG_ENV="$(cat deploy.env)" || { echo "::error::Cannot read ${DEPLOY_DIR}/deploy.env; nothing changed."; exit 1; }
+          fi
           restore_env() {
-            if [ "${HAD_ENV}" = 1 ]; then printf '%s\n' "${ORIG_ENV}" > deploy.env; else rm -f deploy.env; fi
+            if [ "${HAD_ENV}" = 1 ]; then write_tracking deploy.env "${ORIG_ENV}"; else rm -f deploy.env; fi
           }
           # Failure before `compose up`: containers were never touched, so NO rollback — just
           # restore deploy.env and fail the job.
           abort_before_up() {
             echo "::error::$1 Running containers were NOT modified."
-            restore_env
+            restore_env || echo "::error::deploy.env could not be restored: it may reference ${NEW_TAG} while the containers still run the previous version — fix it manually (see deploy.env.last-good)."
             exit 1
           }
 
@@ -253,7 +286,8 @@ jobs:
             || abort_before_up "Could not stage docker-compose.server.yml."
 
           echo "Pulling images ${NEW_TAG}..."
-          printf 'PASSEFILTRE_IMAGE_TAG=%s\n' "${NEW_TAG}" > deploy.env
+          write_tracking deploy.env "PASSEFILTRE_IMAGE_TAG=${NEW_TAG}" \
+            || abort_before_up "Could not write deploy.env."
           compose pull || abort_before_up "Pull of ${NEW_TAG} failed."
 
           echo "Validating merged Compose configuration..."
@@ -267,7 +301,10 @@ jobs:
           fi
           if [ "${LATEST}" != "${SHA}" ]; then
             echo "::notice::main advanced to ${LATEST}; a newer deploy will take over. Containers left unchanged."
-            restore_env
+            if ! restore_env; then
+              echo "::error::deploy.env could not be restored after stepping aside — fix it manually (see deploy.env.last-good)."
+              exit 1
+            fi
             exit 0
           fi
 
@@ -279,8 +316,13 @@ jobs:
           echo "Waiting for the frontend ..."
           frontend_ok || rollback
 
-          # Both API and frontend are healthy: commit this as the new known-good version.
-          cp -f deploy.env deploy.env.last-good
+          # Both API and frontend are healthy: record this as the new known-good version. The
+          # deployment is only validated once this reference is durably written; otherwise the
+          # job fails (the previous last-good stays intact thanks to the atomic rename).
+          if ! write_tracking deploy.env.last-good "PASSEFILTRE_IMAGE_TAG=${NEW_TAG}"; then
+            echo "::error::${NEW_TAG} is running and healthy, but deploy.env.last-good could not be recorded. Deployment NOT validated — fix ${DEPLOY_DIR} (permissions/disk space), then re-run this workflow."
+            exit 1
+          fi
           echo "::notice::PasseFiltre is live on http://${BIND}:${FPORT} (API http://${BIND}:${BPORT}) — ${NEW_TAG}."
 
       - name: Log out of GHCR
