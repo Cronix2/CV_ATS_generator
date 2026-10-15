@@ -47,8 +47,23 @@ push sur main
 - Runner self-hosted dédié au dépôt, labels `self-hosted`, `Linux`, `ARM64`,
   service `actions.runner.Cronix2-CV_ATS_generator.serveurcasa.service`, accès
   Docker via le groupe `docker`.
+- **Label dédié `passefiltre`** à ajouter au runner. Le job de déploiement cible
+  `runs-on: [self-hosted, Linux, ARM64, passefiltre]` pour ne jamais être
+  exécuté par un autre runner ARM64 (autre projet). Ajout du label (à faire une
+  fois sur le serveur, dans le dossier du runner) :
+
+  ```bash
+  # runner en service : reconfigurer les labels
+  sudo ./svc.sh stop
+  ./config.sh --labels passefiltre          # ajoute le label au runner existant
+  sudo ./svc.sh start
+  # vérifier ensuite dans Settings → Actions → Runners que « passefiltre » est présent
+  ```
+
 - Docker Engine + plugin `docker compose` **≥ 2.24.4** (nécessaire pour le tag
   YAML `!reset` utilisé par `docker-compose.server.yml`).
+- `flock` (paquet `util-linux`, présent par défaut) : sérialise les
+  déploiements concurrents côté serveur.
 - Répertoire `/opt/passefiltre/` appartenant à `cronix`.
 - `/opt/passefiltre/.env` (permissions `600`, appartenant à `cronix`) contenant
   au minimum :
@@ -111,8 +126,12 @@ Playwright émulée). Les builds suivants réutilisent le cache GitHub Actions.
 Rien à faire : un `push` sur `main` qui passe la CI met à jour PasseFiltre.
 Le workflow :
 
-- vérifie que le commit est **toujours la tête de `main`** (sinon il s'arrête
-  proprement : un déploiement plus récent s'en chargera) ;
+- vérifie **deux fois** que le commit est toujours la tête de `main` : une fois
+  au début, puis **juste avant** de toucher aux conteneurs (après le build et le
+  pull des images). Si `main` a avancé entre-temps, il s'arrête **sans modifier
+  les conteneurs** : le déploiement plus récent prend le relais ;
+- sérialise les déploiements concurrents via un verrou serveur (`flock`), en
+  plus du groupe `concurrency` GitHub Actions ;
 - met à jour **uniquement** le projet Compose `passefiltre` (`-p passefiltre`) :
   les autres piles Docker du serveur ne sont jamais touchées ;
 - conserve le volume nommé `passefiltre_sessions` (sessions LinkedIn).
@@ -134,6 +153,7 @@ pf() { docker compose -p passefiltre -f docker-compose.yml -f docker-compose.ser
 | Logs API en direct | `pf logs -f api` |
 | Logs frontend | `pf logs -f web` |
 | Version déployée (tag) | `cat deploy.env` |
+| Dernière version saine | `cat deploy.env.last-good` |
 | Santé de l'API | `curl -fsS http://192.168.1.63:8100/api/health` |
 | Config fusionnée (sans secret) | `pf config -q && echo OK` |
 | Logs du runner | `journalctl -u actions.runner.Cronix2-CV_ATS_generator.serveurcasa.service -f` |
@@ -142,20 +162,29 @@ pf() { docker compose -p passefiltre -f docker-compose.yml -f docker-compose.ser
 
 ### Automatique
 
-Si un `pull`, le `up -d` ou un healthcheck échoue, le job restaure
-automatiquement le tag précédent (`deploy.env.previous`), relance les
-conteneurs, revérifie l'API, puis **échoue explicitement** pour signaler le
-problème. Le volume des sessions LinkedIn n'est jamais supprimé.
+Si un `pull`, le `up -d`, un healthcheck API **ou** un healthcheck frontend
+échoue, le job :
+
+1. restaure le **dernier déploiement ayant passé TOUS les healthchecks**,
+   enregistré dans `deploy.env.last-good` (jamais une simple tentative
+   précédente) ;
+2. relance les conteneurs puis revérifie **l'API ET le frontend** avant de
+   déclarer le rollback réussi (aucune erreur n'est masquée) ;
+3. **échoue explicitement** le job pour signaler le problème.
+
+Le fichier `deploy.env.last-good` n'est mis à jour qu'après un déploiement
+entièrement sain : c'est la cible de rollback garantie fonctionnelle. Le volume
+des sessions LinkedIn n'est jamais supprimé.
 
 ### Manuel
 
 ```bash
 cd /opt/passefiltre
-cat deploy.env            # tag actuel
-cat deploy.env.previous   # tag précédent
+cat deploy.env            # tag actuellement visé
+cat deploy.env.last-good  # dernière version 100 % saine
 
-# Revenir au tag précédent :
-cp -f deploy.env.previous deploy.env
+# Revenir à la dernière version saine :
+cp -f deploy.env.last-good deploy.env
 pf pull
 pf up -d
 
@@ -166,6 +195,36 @@ pf pull && pf up -d
 
 Les images restent dans le cache local de Docker : un rollback n'exige pas de
 réseau si l'image visée a déjà été téléchargée.
+
+## 7bis. Tag basé sur un SHA vs digest réellement immuable
+
+Le déploiement épingle les images par un tag `sha-<commit>` (le SHA Git du
+commit validé par la CI). Ce tag est **traçable et stable par convention**, mais
+ce n'est **pas** une référence cryptographiquement immuable :
+
+- Un **tag** (`…:sha-<commit>`, `…:main`, `…:latest`) est un simple *pointeur*
+  mutable. Rien n'empêche techniquement de re-pousser le même tag vers un autre
+  contenu d'image (écrasement). Il garantit *d'où vient* l'image (quel commit),
+  pas que son *contenu* est figé.
+- Un **digest OCI** (`…@sha256:<hash>`) est l'empreinte du contenu de l'image.
+  Il est **immuable par construction** : le même digest renvoie toujours
+  exactement les mêmes octets, impossible à ré-associer à un autre contenu.
+
+Pour un déploiement strictement reproductible, pointer sur un digest plutôt que
+sur un tag. `PASSEFILTRE_IMAGE_TAG` accepte les deux formes grâce à la
+référence `image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG}` —
+il suffit d'y mettre une valeur commençant par `@sha256:` (ou d'adapter la
+référence). Récupérer le digest publié :
+
+```bash
+# digest de l'image arm64 publiée pour un commit donné
+docker buildx imagetools inspect ghcr.io/cronix2/passefiltre-api:sha-<commit> \
+  --format '{{json .Manifest.Digest}}'
+```
+
+> Durcissement optionnel côté GHCR : activer les **tags immuables** sur
+> l'organisation/dépôt empêche l'écrasement d'un tag existant, ce qui rapproche
+> la garantie d'un tag `sha-<commit>` de celle d'un digest.
 
 ## 8. Comportement après un redémarrage du Raspberry Pi
 
@@ -199,8 +258,10 @@ Si les images sont **privées** et que le pull échoue sur le runner
 ### Runner
 
 - Statut : `systemctl status actions.runner.Cronix2-CV_ATS_generator.serveurcasa.service`
-- Labels attendus : `self-hosted`, `Linux`, `ARM64` (le job cible
-  `runs-on: [self-hosted, Linux, ARM64]`).
+- Labels attendus : `self-hosted`, `Linux`, `ARM64`, **`passefiltre`** (le job
+  cible `runs-on: [self-hosted, Linux, ARM64, passefiltre]`). Si le job reste
+  *Queued* indéfiniment, c'est généralement que le label `passefiltre` manque sur
+  le runner (voir §2 pour l'ajouter).
 - Accès Docker : `docker ps` doit fonctionner en tant que `cronix` (groupe
   `docker`).
 

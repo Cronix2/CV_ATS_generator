@@ -7,7 +7,10 @@
 # Everything else (ports, volumes, security_opt, restart, env_file, shm_size…) is
 # inherited from docker-compose.yml and driven by /opt/passefiltre/.env, so this
 # overlay only does three things:
-#   1. Pin both services to immutable, prebuilt GHCR images (tag = sha-<commit>).
+#   1. Pin both services to a prebuilt GHCR image for the exact commit (tag = sha-<commit>).
+#      Note: a tag is a mutable pointer, not a cryptographic digest. For stronger,
+#      truly immutable pinning, set PASSEFILTRE_IMAGE_TAG to an OCI digest (@sha256:...)
+#      instead — see docs/deployment-serveurcasa.md (« Tag SHA vs digest »).
 #   2. Drop the `build:` sections so the Pi can NEVER rebuild an image locally.
 #   3. Lock the Compose project name to `passefiltre` for strict isolation from
 #      the other Docker stacks running on the server.
@@ -26,7 +29,7 @@ services:
     # Never build on the Pi: use the arm64 image published by GitHub Actions.
     build: !reset null
     image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:?PASSEFILTRE_IMAGE_TAG is required (see /opt/passefiltre/deploy.env)}
-    pull_policy: missing   # immutable sha- tag: pull once, reuse across reboots
+    pull_policy: missing   # commit-pinned tag/digest: pull once, reuse across reboots
 
   web:
     build: !reset null

@@ -11,8 +11,12 @@
 #   - Triggered via `workflow_run`, so this workflow (and its secrets) always runs from the
 #     version on the default branch, never from untrusted pull-request code.
 #   - Guards ensure it only runs for a *successful push to main* (never for pull requests).
-#   - Least-privilege GITHUB_TOKEN; no long-lived credentials; images pinned by immutable SHA tag.
-#   - A freshness check prevents an older run from overwriting a newer commit already on main.
+#   - Least-privilege GITHUB_TOKEN; no long-lived credentials; images pinned by a commit-SHA
+#     tag (`sha-<commit>`). A tag is not cryptographically immutable — see the digest note in
+#     docs/deployment-serveurcasa.md for the difference with an OCI `@sha256:` digest.
+#   - Two independent guards prevent stale deploys from overwriting a newer commit on main:
+#     an early freshness check, and a second re-check right before the containers are touched,
+#     plus a server-side file lock (flock) serializing concurrent deployments.
 name: Deploy to ServeurCasa
 
 on:
@@ -23,8 +27,9 @@ on:
 # Nothing by default; each job requests only what it needs.
 permissions: {}
 
-# One deployment at a time. Combined with the freshness check in the deploy job, this
-# prevents concurrent deploys and stops a slow/old run from clobbering a newer one.
+# One deployment at a time at the workflow level. This is reinforced in the deploy job by a
+# server-side file lock (flock) and a re-check of main's HEAD right before touching containers,
+# since GitHub concurrency alone does not guarantee commit ordering across queued runs.
 concurrency:
   group: deploy-serveurcasa
   cancel-in-progress: false
@@ -86,7 +91,9 @@ jobs:
   deploy:
     name: Deploy on ServeurCasa
     needs: build
-    runs-on: [self-hosted, Linux, ARM64]
+    # The `passefiltre` label pins this to the dedicated runner, so another ARM64 self-hosted
+    # runner (another repo/project) can never pick up this deployment job.
+    runs-on: [self-hosted, Linux, ARM64, passefiltre]
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
@@ -162,6 +169,12 @@ jobs:
 
           compose() { docker compose -p passefiltre -f docker-compose.yml -f docker-compose.server.yml --env-file .env --env-file deploy.env "$@"; }
 
+          main_head() {
+            curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/main" \
+              | grep -m1 '"sha"' | sed -E 's/.*"sha": *"([0-9a-f]+)".*/\1/'
+          }
+
           health_ok() {
             for _ in $(seq 1 60); do
               if curl -fsS -o /dev/null "http://${BIND}:${BPORT}/api/health"; then return 0; fi
@@ -177,33 +190,53 @@ jobs:
             return 1
           }
 
-          # Remember the currently deployed tag so we can roll back to it.
-          if [ -f deploy.env ]; then cp -f deploy.env deploy.env.previous; fi
-          printf 'PASSEFILTRE_IMAGE_TAG=%s\n' "${NEW_TAG}" > deploy.env
-
+          # Roll back to the last version that passed EVERY health check (deploy.env.last-good),
+          # never merely to the previous attempt. Rollback errors are reported, never swallowed,
+          # and both API and frontend must be healthy before a rollback is called a success.
           rollback() {
             echo "::error::Deployment of ${NEW_TAG} failed."
-            if [ -f deploy.env.previous ]; then
-              echo "Rolling back to the previous version..."
-              cp -f deploy.env.previous deploy.env
-              compose pull || true
-              compose up -d || true
-              if health_ok; then
-                echo "::warning::Rolled back to the previous working version."
+            if [ -f deploy.env.last-good ]; then
+              echo "Rolling back to the last known-good version ($(cat deploy.env.last-good))..."
+              cp -f deploy.env.last-good deploy.env
+              if compose pull && compose up -d && health_ok && frontend_ok; then
+                echo "::warning::Rolled back to the last known-good version (API + frontend healthy)."
               else
-                echo "::error::Rollback health check also failed — manual intervention required."
+                echo "::error::Rollback FAILED (API or frontend still unhealthy) — manual intervention required."
               fi
             else
-              echo "::error::No previous version recorded; cannot roll back. Containers left as-is."
+              echo "::error::No known-good version recorded; cannot roll back. Containers left unchanged."
             fi
             exit 1
           }
 
+          # Serialize deployments on the server: no two runs may touch the containers at once,
+          # even if something outside this workflow triggers a parallel deploy.
+          exec 9>".deploy.lock"
+          if ! flock -w 600 9; then
+            echo "::error::Could not acquire the deployment lock within 10 min (another deploy running?)."
+            exit 1
+          fi
+
           echo "Pulling images ${NEW_TAG}..."
+          printf 'PASSEFILTRE_IMAGE_TAG=%s\n' "${NEW_TAG}" > deploy.env
           compose pull || rollback
 
           echo "Validating merged Compose configuration..."
           compose config -q || rollback
+
+          # Re-check HEAD of main *immediately* before changing containers: a newer commit may
+          # have landed while the arm64 images were building and pulling. If so, step aside
+          # WITHOUT touching the running containers (a newer deploy will take over).
+          LATEST="$(main_head)"
+          if [ -z "${LATEST}" ]; then
+            echo "::error::Could not resolve HEAD of main before updating containers."
+            rollback
+          fi
+          if [ "${LATEST}" != "${SHA}" ]; then
+            echo "::notice::main advanced to ${LATEST}; a newer deploy will take over. Containers left unchanged."
+            if [ -f deploy.env.last-good ]; then cp -f deploy.env.last-good deploy.env; fi
+            exit 0
+          fi
 
           echo "Updating the passefiltre containers..."
           compose up -d --remove-orphans || rollback
@@ -213,6 +246,8 @@ jobs:
           echo "Waiting for the frontend ..."
           frontend_ok || rollback
 
+          # Both API and frontend are healthy: commit this as the new known-good version.
+          cp -f deploy.env deploy.env.last-good
           echo "::notice::PasseFiltre is live on http://${BIND}:${FPORT} (API http://${BIND}:${BPORT}) — ${NEW_TAG}."
 
       - name: Log out of GHCR
