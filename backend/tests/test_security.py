@@ -189,6 +189,33 @@ def test_post_from_foreign_origin_is_refused(client):
     assert client.post("/api/export/pdf", json=cv, headers={"Origin": "http://localhost:3000"}).status_code == 200
 
 
+# --- Reverse proxy HTTPS : UI et API sur la même origine (/ -> web, /api/ -> api) ------------------
+
+SITE = "https://passefiltre.local.cronix.fr"
+
+
+def test_same_origin_https_host_is_allowed(monkeypatch):
+    from app.security import allowed_hosts
+    monkeypatch.delenv("ALLOWED_HOSTS", raising=False)
+    monkeypatch.setenv("NEXT_PUBLIC_API_URL", SITE)
+    assert "passefiltre.local.cronix.fr" in allowed_hosts()
+    monkeypatch.setenv("NEXT_PUBLIC_API_URL", SITE + "/api")  # a path never leaks into the host list
+    assert "passefiltre.local.cronix.fr" in allowed_hosts()
+    monkeypatch.setenv("NEXT_PUBLIC_API_URL", "http://192.168.1.63:8100")
+    monkeypatch.setenv("ALLOWED_HOSTS", "passefiltre.local.cronix.fr,192.168.1.63")
+    assert {"passefiltre.local.cronix.fr", "192.168.1.63"} <= set(allowed_hosts())
+
+
+def test_same_origin_https_ui_must_be_listed_in_cors_origins(monkeypatch, client):
+    cv = {"profile": {"basics": {"full_name": "Jane"}}}
+    monkeypatch.setenv("CORS_ORIGINS", "http://192.168.1.63:3101")  # old LAN-only configuration
+    assert client.post("/api/export/pdf", json=cv, headers={"Origin": SITE}).status_code == 403
+    monkeypatch.setenv("CORS_ORIGINS", f"{SITE},http://192.168.1.63:3101")
+    assert client.post("/api/export/pdf", json=cv, headers={"Origin": SITE}).status_code == 200
+    assert client.post("/api/export/pdf", json=cv, headers={"Origin": "http://192.168.1.63:3101"}).status_code == 200
+    assert client.post("/api/export/pdf", json=cv, headers={"Origin": "https://evil.example"}).status_code == 403
+
+
 # --- Mise en réseau : jeton obligatoire ----------------------------------------------------------
 
 @pytest.mark.parametrize("var,value", [("ALLOWED_HOSTS", "passefiltre.lan"), ("BIND_ADDRESS", "0.0.0.0"),

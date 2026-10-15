@@ -72,11 +72,20 @@ push sur main
   BACKEND_PORT=8100
   FRONTEND_PORT=3101
   BIND_ADDRESS=192.168.1.63
-  NEXT_PUBLIC_API_URL=http://192.168.1.63:8100
-  CORS_ORIGINS=http://192.168.1.63:3101
-  ALLOWED_HOSTS=192.168.1.63
+  NEXT_PUBLIC_API_URL=https://passefiltre.local.cronix.fr
+  CORS_ORIGINS=https://passefiltre.local.cronix.fr,http://192.168.1.63:3101
+  ALLOWED_HOSTS=passefiltre.local.cronix.fr,192.168.1.63
   PASSEFILTRE_TOKEN=<jeton secret ≥ 32 caractères>
   ```
+
+  `CORS_ORIGINS` et `ALLOWED_HOSTS` doivent contenir le domaine HTTPS (voir
+  §2bis). `http://192.168.1.63:3101` et `192.168.1.63` ne servent qu'à garder
+  l'accès direct par IP (healthchecks du workflow, dépannage) : les retirer si
+  cet accès n'est plus voulu — le healthcheck du workflow, qui appelle
+  `http://192.168.1.63:8100/api/health`, a besoin de `192.168.1.63` dans
+  `ALLOWED_HOSTS`. Côté serveur, `NEXT_PUBLIC_API_URL` ne sert qu'à la liste
+  des hôtes autorisés : l'URL réellement utilisée par le navigateur est celle
+  figée dans l'image `web` par le workflow.
 
   Ce fichier **n'est jamais** modifié, affiché ni copié par le workflow : il est
   seulement vérifié présent (`test -f`).
@@ -86,14 +95,69 @@ push sur main
 - Rien d'obligatoire : le workflow utilise `GITHUB_TOKEN` (aucun secret à créer).
 - Variable de dépôt **facultative** `SERVEURCASA_API_URL` pour surcharger
   l'URL de l'API intégrée au build du frontend (défaut :
-  `http://192.168.1.63:8100`).
+  `https://passefiltre.local.cronix.fr`). Elle doit être une **origine HTTPS
+  seule** (`https://hôte[:port]`, sans chemin, sans `/api`, sans `/` final) :
+  le job `build` échoue sinon (étape *Validate frontend API URL*).
 
 > **Important — construction du frontend.** `NEXT_PUBLIC_API_URL` est **figé au
 > moment du build** Next.js (voir `frontend/Dockerfile`). Le job `build`
-> construit donc l'image `web` avec `NEXT_PUBLIC_API_URL=http://192.168.1.63:8100`
-> pour que le navigateur appelle bien l'API du réseau local. Changer de port ou
-> d'IP impose de **reconstruire** l'image `web` (un nouveau push sur `main`
-> suffit).
+> construit donc l'image `web` avec
+> `NEXT_PUBLIC_API_URL=https://passefiltre.local.cronix.fr` pour que le
+> navigateur appelle l'API **sur le même domaine HTTPS** que l'interface
+> (§2bis). Changer de domaine impose de **reconstruire** l'image `web` (un
+> nouveau push sur `main` suffit).
+
+## 2bis. Accès HTTPS via Nginx Proxy Manager (même origine)
+
+L'interface est servie sur <https://passefiltre.local.cronix.fr> par Nginx Proxy
+Manager (NPM, existant, hors de ce dépôt), qui route :
+
+| Chemin | Cible | Service |
+| --- | --- | --- |
+| `/` | `http://192.168.1.63:3101` | `web` (Next.js) |
+| `/api/` | `http://192.168.1.63:8100` | `api` (FastAPI) |
+
+Le frontend appelle l'API à `NEXT_PUBLIC_API_URL` + `/api/...` (toutes les
+routes de `frontend/lib/api.ts` commencent déjà par `/api/`). Avec
+`NEXT_PUBLIC_API_URL=https://passefiltre.local.cronix.fr`, le navigateur appelle
+donc `https://passefiltre.local.cronix.fr/api/...` : **même origine**, pas de
+contenu mixte HTTP/HTTPS, CSP `connect-src` satisfaite.
+
+**Éviter `/api/api/`** :
+
+- `NEXT_PUBLIC_API_URL` est une **origine**, jamais `…/api`. Par sécurité,
+  `frontend/lib/apiBase.ts` retire un `/api` ou un `/` final, et le workflow
+  refuse toute valeur avec un chemin.
+- Dans NPM, la *Custom location* `/api/` doit transmettre le chemin **tel
+  quel** à `http://192.168.1.63:8100` (aucune réécriture, pas de chemin
+  ajouté après le port) : l'API attend `/api/health`, `/api/scrape`, etc.
+
+**CORS et hôtes autorisés** (à régler dans `/opt/passefiltre/.env`, voir §2) :
+
+- Même en même origine, le navigateur envoie `Origin:
+  https://passefiltre.local.cronix.fr` sur les `POST`. L'API refuse (`403`)
+  toute origine absente de `CORS_ORIGINS` : le domaine HTTPS **doit** y figurer,
+  sinon le scraping, l'IA et l'export échouent alors que `/api/health` (GET)
+  répond.
+- NPM transmet l'en-tête `Host: passefiltre.local.cronix.fr` : il doit être
+  dans `ALLOWED_HOSTS` (ou déduit de `NEXT_PUBLIC_API_URL`), sinon `400`.
+- Après modification du `.env`, recréer le conteneur API (l'environnement est
+  lu au démarrage) : `pf up -d api` (voir §6), ou attendre le prochain
+  déploiement.
+
+**Autres environnements** : inchangés. En développement (`npm start`,
+`npm run dev`) et avec `docker-compose.yml` seul, l'URL par défaut reste
+`http://localhost:<BACKEND_PORT>` (origines différentes : `localhost:3000`
+est dans `CORS_ORIGINS` par défaut). Les images de release (`release.yml`)
+ne sont pas concernées.
+
+Vérification après déploiement :
+
+```bash
+curl -fsS https://passefiltre.local.cronix.fr/api/health
+# Dans le navigateur (outils de développement → Réseau) : les requêtes partent vers
+# https://passefiltre.local.cronix.fr/api/... (jamais 192.168.1.63:8100 ni /api/api/).
+```
 
 ## 3. Déclenchement automatique
 
@@ -115,8 +179,9 @@ la CI déclenche automatiquement :
 3. Faire un petit commit sur `main` (ou relancer la CI) pour déclencher le
    workflow.
 4. Suivre l'exécution dans **Actions → Deploy to ServeurCasa**.
-5. Au succès : <http://192.168.1.63:3101> (frontend) et
-   <http://192.168.1.63:8100/api/health> (API).
+5. Au succès : <https://passefiltre.local.cronix.fr> (frontend) et
+   <https://passefiltre.local.cronix.fr/api/health> (API). Les healthchecks
+   du workflow, eux, interrogent directement `192.168.1.63:8100` / `:3101`.
 
 Le premier build `arm64` sous QEMU est lent (installation de Chromium /
 Playwright émulée). Les builds suivants réutilisent le cache GitHub Actions.
@@ -155,6 +220,7 @@ pf() { docker compose -p passefiltre -f docker-compose.yml -f docker-compose.ser
 | Version déployée (tag) | `cat deploy.env` |
 | Dernière version saine | `cat deploy.env.last-good` |
 | Santé de l'API | `curl -fsS http://192.168.1.63:8100/api/health` |
+| Santé via NPM (HTTPS) | `curl -fsS https://passefiltre.local.cronix.fr/api/health` |
 | Config fusionnée (sans secret) | `pf config -q && echo OK` |
 | Logs du runner | `journalctl -u actions.runner.Cronix2-CV_ATS_generator.serveurcasa.service -f` |
 
@@ -297,11 +363,12 @@ antérieure à 2.24.4. Mettre à jour le plugin Compose.
 
 ## 10. Limitations de sécurité (HTTP sur le LAN)
 
-- **Pas de chiffrement.** L'accès se fait en **HTTP clair** sur
-  `192.168.1.63:3101`/`:8100`. Les identifiants LinkedIn et le
-  `PASSEFILTRE_TOKEN` transitent **en clair sur le réseau local** : quiconque
-  peut écouter le LAN (Wi-Fi, switch compromis) peut les intercepter. À
-  n'utiliser que sur un réseau de confiance.
+- **Chiffrement partiel.** Via <https://passefiltre.local.cronix.fr>, le trajet
+  navigateur → NPM est chiffré ; le trajet NPM → `192.168.1.63:3101`/`:8100`
+  reste en **HTTP clair**, comme l'accès direct par IP. Les identifiants
+  LinkedIn et le `PASSEFILTRE_TOKEN` peuvent donc encore transiter en clair
+  sur le réseau local (sauf si NPM tourne sur le Pi lui-même) : à n'utiliser
+  que sur un réseau de confiance, et privilégier l'URL HTTPS.
 - **Le bind sur une IP privée n'est pas un pare-feu.** Publier les ports sur
   `192.168.1.63` limite l'interface d'écoute mais ne filtre pas les hôtes du
   LAN. Pour restreindre réellement l'accès, ajouter des règles de pare-feu sur
@@ -313,10 +380,9 @@ antérieure à 2.24.4. Mettre à jour le plugin Compose.
   sudo ufw allow from 192.168.1.0/24 to any port 8100 proto tcp
   ```
 
-- **Aucune exposition Internet.** Pas de Cloudflare Tunnel, pas de proxy Caddy,
-  pas d'ouverture des ports 80/443. Pour un accès chiffré, utiliser le profil
-  `https` de `docker-compose.yml` (Caddy + certificat), hors périmètre de ce
-  déploiement.
+- **Aucune exposition Internet par ce workflow.** Pas de Cloudflare Tunnel, pas
+  de proxy Caddy, pas d'ouverture des ports 80/443 : le HTTPS est fourni par le
+  Nginx Proxy Manager existant, que le workflow ne configure ni ne redémarre.
 - Le `PASSEFILTRE_TOKEN` reste **obligatoire** : l'API refuse de démarrer sans
   un jeton ≥ 32 caractères dès qu'elle est exposée au réseau (`BIND_ADDRESS`
   non-loopback).

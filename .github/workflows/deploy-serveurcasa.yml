@@ -55,10 +55,23 @@ jobs:
             build_args: ""
           - name: web
             context: frontend
-            # Baked into the Next.js build: the browser calls the API at this LAN address.
+            # Baked into the Next.js build: the browser calls the API on the SAME HTTPS origin as the
+            # UI (Nginx Proxy Manager routes /api/ to the API container). Origin only, no /api suffix:
+            # the frontend already prefixes every route with /api/.
             build_args: |
-              NEXT_PUBLIC_API_URL=${{ vars.SERVEURCASA_API_URL || 'http://192.168.1.63:8100' }}
+              NEXT_PUBLIC_API_URL=${{ vars.SERVEURCASA_API_URL || 'https://passefiltre.local.cronix.fr' }}
     steps:
+      # Fail fast on a malformed frontend API URL (http, trailing /api, path, query...).
+      - name: Validate frontend API URL
+        if: matrix.name == 'web'
+        env:
+          API_URL: ${{ vars.SERVEURCASA_API_URL || 'https://passefiltre.local.cronix.fr' }}
+        run: |
+          if [[ ! "${API_URL}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+            echo "::error::NEXT_PUBLIC_API_URL must be an https origin without path or trailing slash (got '${API_URL}'). The frontend adds /api/ itself."
+            exit 1
+          fi
+          echo "Frontend will call the API at ${API_URL}/api/..."
       # Build the Dockerfile exactly as it was at the commit CI validated.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
