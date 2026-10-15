@@ -35,7 +35,7 @@ Ouvrez **<http://localhost:3000>**. `Ctrl+C` arrête tout.
 | `npm run setup` | Installe tout (relançable sans risque après une mise à jour). |
 | `npm start` | Lance l'API et l'interface en mode développement. |
 | `npm run prod` | Build de l'interface puis lancement en mode production. |
-| `npm test` | Tests du backend + vérification des types du frontend. |
+| `npm test` | Tests du backend + vérification des types et tests unitaires du frontend. |
 
 ### Option B : avec Docker
 
@@ -58,7 +58,7 @@ Tout se règle dans **un seul fichier `.env`** à la racine (créé par `npm run
 | Variable | Défaut | Rôle |
 | --- | --- | --- |
 | `BACKEND_PORT` / `FRONTEND_PORT` | `8000` / `3000` | Ports de l'API et de l'interface. |
-| `NEXT_PUBLIC_API_URL` | `http://localhost:<BACKEND_PORT>` | Adresse de l'API vue par le navigateur (à changer pour un accès depuis une autre machine). |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:<BACKEND_PORT>` | Adresse de l'API vue par le navigateur (à changer pour un accès depuis une autre machine). Origine seule, **sans** `/api` (ex. `https://passefiltre.lan`) : le frontend ajoute `/api/...` lui-même. |
 | `CORS_ORIGINS` | l'interface | Origines autorisées à appeler l'API, séparées par des virgules. |
 | `LLM_API_KEY` | *(vide)* | Clé LLM par défaut : l'agent IA marche alors sans saisir de clé dans l'interface. La clé n'est jamais envoyée au navigateur. |
 | `LLM_BASE_URL` | *(vide = OpenAI)* | URL de base compatible OpenAI, celle qui précède `/chat/completions`. |
@@ -98,7 +98,7 @@ Par défaut, PasseFiltre n'est joignable que depuis la machine qui le lance. Pou
 
 ### Déploiement continu (self-hosted)
 
-Un déploiement continu vers un serveur ARM64 (Raspberry Pi) est décrit dans [docs/deployment-serveurcasa.md](docs/deployment-serveurcasa.md) : chaque push sur `main` validé par la CI construit les images `linux/arm64`, les publie sur GHCR et met à jour le serveur automatiquement (healthchecks + rollback, données persistantes préservées).
+Un déploiement continu vers un serveur ARM64 (Raspberry Pi) est décrit dans [docs/deployment-serveurcasa.md](docs/deployment-serveurcasa.md) : chaque push sur `main` validé par la CI construit les images `linux/arm64`, les publie sur GHCR et met à jour le serveur automatiquement (healthchecks + rollback, données persistantes préservées). Le frontend y est construit pour appeler l'API sur le même domaine HTTPS (`https://passefiltre.local.cronix.fr`, routage `/api/` par Nginx Proxy Manager).
 
 ## Sécurité
 

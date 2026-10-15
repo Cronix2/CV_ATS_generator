@@ -4,7 +4,7 @@
 //   npm run setup     install everything: Python venv + deps, Chromium for Scrapling, frontend deps, .env
 //   npm start         start the API + the web app (auto-reload while you edit the code)
 //   npm run prod      build the web app and start both in production mode
-//   npm test          backend tests + frontend type-check
+//   npm test          backend tests + frontend type-check + frontend unit tests
 //
 // Configuration lives in a single `.env` file at the repository root (copied from .env.example by setup).
 
@@ -177,6 +177,8 @@ function test() {
   run(VENV_PY, ["-m", "pytest", "-q"], BACKEND);
   step("Vérification des types du frontend");
   run(process.execPath, [TSC, "--noEmit", "-p", "."], FRONTEND);
+  step("Tests du frontend");
+  run(process.execPath, ["--experimental-strip-types", "--test", "tests/**/*.test.ts"], FRONTEND);
   console.log(`\n${green("✔")} Tout est vert.`);
 }
 

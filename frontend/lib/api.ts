@@ -1,6 +1,7 @@
+import { apiBase } from "./apiBase";
 import type { AgentName, AgentResult, ChatMessage, CV, Job, LLMConfig, Profile, ServerConfig, Suggestions } from "./types";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"; // empty in .env = default
+const API = apiBase(process.env.NEXT_PUBLIC_API_URL); // origin only: routes below already start with /api/
 
 // Access token (only when the server sets PASSEFILTRE_TOKEN). Kept in memory + sessionStorage by the store.
 let apiToken = "";
