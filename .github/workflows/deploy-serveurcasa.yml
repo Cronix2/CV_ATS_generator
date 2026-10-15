@@ -1,0 +1,330 @@
+# Continuous Deployment to ServeurCasa (Raspberry Pi 5, linux/arm64).
+#
+# Flow:
+#   push to main  ->  CI workflow (ci.yml)  ->  [this workflow, only if CI succeeded]
+#     1. build  : GitHub-hosted runner cross-builds arm64 images and pushes them to GHCR,
+#                 tagged with the exact commit SHA that CI validated.
+#     2. deploy : the self-hosted arm64 runner on ServeurCasa pulls those images and
+#                 updates ONLY the `passefiltre` Compose project, with health-check + rollback.
+#
+# Security model:
+#   - Triggered via `workflow_run`, so this workflow (and its secrets) always runs from the
+#     version on the default branch, never from untrusted pull-request code.
+#   - Guards ensure it only runs for a *successful push to main* (never for pull requests).
+#   - Least-privilege GITHUB_TOKEN; no long-lived credentials; images pinned by a commit-SHA
+#     tag (`sha-<commit>`). A tag is not cryptographically immutable — see the digest note in
+#     docs/deployment-serveurcasa.md for the difference with an OCI `@sha256:` digest.
+#   - Two independent guards prevent stale deploys from overwriting a newer commit on main:
+#     an early freshness check, and a second re-check right before the containers are touched,
+#     plus a server-side file lock (flock) serializing concurrent deployments.
+name: Deploy to ServeurCasa
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+# Nothing by default; each job requests only what it needs.
+permissions: {}
+
+# One deployment at a time at the workflow level. This is reinforced in the deploy job by a
+# server-side file lock (flock) and a re-check of main's HEAD right before touching containers,
+# since GitHub concurrency alone does not guarantee commit ordering across queued runs.
+concurrency:
+  group: deploy-serveurcasa
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & push arm64 images
+    runs-on: ubuntu-latest
+    # Only for a CI run that SUCCEEDED, that was a push (not a pull_request), on main.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: api
+            context: backend
+            build_args: ""
+          - name: web
+            context: frontend
+            # Baked into the Next.js build: the browser calls the API at this LAN address.
+            build_args: |
+              NEXT_PUBLIC_API_URL=${{ vars.SERVEURCASA_API_URL || 'http://192.168.1.63:8100' }}
+    steps:
+      # Build the Dockerfile exactly as it was at the commit CI validated.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          build-args: ${{ matrix.build_args }}
+          # Immutable, commit-pinned tag + a convenience `main` tag.
+          tags: |
+            ghcr.io/cronix2/passefiltre-${{ matrix.name }}:sha-${{ github.event.workflow_run.head_sha }}
+            ghcr.io/cronix2/passefiltre-${{ matrix.name }}:main
+          # Dedicated arm64 cache scope: never mixes with the amd64 CI/release caches.
+          cache-from: type=gha,scope=${{ matrix.name }}-arm64
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}-arm64
+
+  deploy:
+    name: Deploy on ServeurCasa
+    needs: build
+    # The `passefiltre` label pins this to the dedicated runner, so another ARM64 self-hosted
+    # runner (another repo/project) can never pick up this deployment job.
+    runs-on: [self-hosted, Linux, ARM64, passefiltre]
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    permissions:
+      contents: read
+      packages: read    # pull from ghcr.io
+    env:
+      DEPLOY_DIR: /opt/passefiltre
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # Compose files matching the images we just built (staged under the deploy lock below).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      # Refuse to deploy a commit that is no longer the tip of main (a newer push won the race).
+      - name: Verify commit is still the tip of main
+        id: freshness
+        run: |
+          set -uo pipefail
+
+          # Reliable HEAD-of-main resolver: no `grep -m1 | sed` pipeline (which can SIGPIPE
+          # under pipefail and fail intermittently). Prefer `gh api --jq`, fall back to
+          # downloading the full JSON then parsing it with Python. Returns non-zero on any
+          # network or parse error so the caller can stop safely.
+          main_head() {
+            if command -v gh >/dev/null 2>&1; then
+              gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha'
+              return
+            fi
+            local body
+            body="$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/main")" || return 1
+            printf '%s' "${body}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
+          }
+
+          if ! latest="$(main_head)" || ! [[ "${latest}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve the current HEAD of main (network error or invalid response). Aborting without any change."
+            exit 1
+          fi
+          if [ "${latest}" != "${SHA}" ]; then
+            echo "::notice::Commit ${SHA} is no longer the tip of main (now ${latest}); a newer deploy will handle it. Skipping."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check deployment prerequisites
+        if: steps.freshness.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          test -d "${DEPLOY_DIR}" || { echo "::error::${DEPLOY_DIR} is missing on the server."; exit 1; }
+          # Confirm the private .env exists WITHOUT reading or printing it.
+          test -f "${DEPLOY_DIR}/.env" || { echo "::error::${DEPLOY_DIR}/.env is missing (create it from .env.example)."; exit 1; }
+          test -r "${DEPLOY_DIR}/.env" || { echo "::error::${DEPLOY_DIR}/.env is not readable by the runner user."; exit 1; }
+          test -w "${DEPLOY_DIR}" || { echo "::error::${DEPLOY_DIR} is not writable by the runner user (tracking files)."; exit 1; }
+          command -v docker >/dev/null || { echo "::error::docker not found on the runner."; exit 1; }
+          docker compose version >/dev/null || { echo "::error::docker compose plugin not available."; exit 1; }
+
+      - name: Log in to GHCR
+        if: steps.freshness.outputs.stale != 'true'
+        run: echo "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Deploy, health-check and rollback on failure
+        if: steps.freshness.outputs.stale != 'true'
+        run: |
+          set -uo pipefail
+          cd "${DEPLOY_DIR}" || { echo "::error::Cannot enter ${DEPLOY_DIR}."; exit 1; }
+
+          NEW_TAG="sha-${SHA}"
+
+          # Read only the non-secret values we need; never touch PASSEFILTRE_TOKEN.
+          get_env() { grep -E "^$1=" .env | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" ; }
+          BIND="$(get_env BIND_ADDRESS)";  BIND="${BIND:-192.168.1.63}"
+          BPORT="$(get_env BACKEND_PORT)"; BPORT="${BPORT:-8100}"
+          FPORT="$(get_env FRONTEND_PORT)"; FPORT="${FPORT:-3101}"
+
+          compose() { docker compose -p passefiltre -f docker-compose.yml -f docker-compose.server.yml --env-file .env --env-file deploy.env "$@"; }
+
+          main_head() {
+            # Same reliable resolver as the freshness step (no SIGPIPE-prone pipeline).
+            if command -v gh >/dev/null 2>&1; then
+              gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha'
+              return
+            fi
+            local body
+            body="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/main")" || return 1
+            printf '%s' "${body}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
+          }
+
+          health_ok() {
+            for _ in $(seq 1 60); do
+              if curl -fsS -o /dev/null "http://${BIND}:${BPORT}/api/health"; then return 0; fi
+              sleep 5
+            done
+            return 1
+          }
+          frontend_ok() {
+            for _ in $(seq 1 24); do
+              if curl -fsS -o /dev/null "http://${BIND}:${FPORT}/"; then return 0; fi
+              sleep 5
+            done
+            return 1
+          }
+
+          # Tracking files (deploy.env, deploy.env.last-good) are written atomically (temp file +
+          # rename, so a failed write never leaves a truncated file) and read back to verify.
+          write_tracking() {  # $1 = file, $2 = content
+            local tmp="$1.tmp.$$"
+            if printf '%s\n' "$2" > "${tmp}" && mv -f "${tmp}" "$1" && [ "$(cat "$1")" = "$2" ]; then
+              return 0
+            fi
+            rm -f "${tmp}"
+            echo "::error::Could not write deployment tracking file $1."
+            return 1
+          }
+          # Prints the content of a tracking file, only if readable and holding exactly one
+          # commit-pinned tag line.
+          read_tracking() {  # $1 = file
+            local c
+            c="$(cat "$1")" || { echo "::error::Could not read $1." >&2; return 1; }
+            [[ "${c}" =~ ^PASSEFILTRE_IMAGE_TAG=sha-[0-9a-f]{40}$ ]] \
+              || { echo "::error::$1 has unexpected content." >&2; return 1; }
+            printf '%s' "${c}"
+          }
+
+          # Only used once `compose up` has started (containers may have changed). Rolls back to
+          # the last version that passed EVERY health check (deploy.env.last-good), never merely
+          # to the previous attempt. Rollback errors are reported, never swallowed, and both API
+          # and frontend must be healthy before a rollback is called a success.
+          rollback() {
+            local good
+            echo "::error::Deployment of ${NEW_TAG} failed."
+            if [ ! -e deploy.env.last-good ]; then
+              echo "::error::No known-good version recorded (first deploy?); automatic rollback impossible — manual intervention required."
+            elif ! good="$(read_tracking deploy.env.last-good)"; then
+              echo "::error::Rollback impossible: deploy.env.last-good is unreadable or invalid — manual intervention required."
+            elif ! write_tracking deploy.env "${good}"; then
+              echo "::error::Rollback impossible: deploy.env could not be written — manual intervention required."
+            else
+              echo "Rolling back to the last known-good version (${good#PASSEFILTRE_IMAGE_TAG=})..."
+              if compose pull && compose up -d && health_ok && frontend_ok; then
+                echo "::warning::Rolled back to the last known-good version (API + frontend healthy)."
+              else
+                echo "::error::Rollback FAILED (API or frontend still unhealthy) — manual intervention required."
+              fi
+            fi
+            exit 1
+          }
+
+          # Serialize deployments on the server: no two runs may touch the containers at once,
+          # even if something outside this workflow triggers a parallel deploy.
+          if ! exec 9>".deploy.lock"; then
+            echo "::error::Cannot open the deployment lock file ${DEPLOY_DIR}/.deploy.lock."
+            exit 1
+          fi
+          if ! flock -w 600 9; then
+            echo "::error::Could not acquire the deployment lock within 10 min (another deploy running?)."
+            exit 1
+          fi
+
+          # Snapshot deploy.env as it is now (= what the running containers use), so any abort
+          # BEFORE `compose up` restores it exactly, even on a first deploy (no last-good yet).
+          HAD_ENV=0; ORIG_ENV=""
+          if [ -e deploy.env ]; then
+            HAD_ENV=1
+            ORIG_ENV="$(cat deploy.env)" || { echo "::error::Cannot read ${DEPLOY_DIR}/deploy.env; nothing changed."; exit 1; }
+          fi
+          restore_env() {
+            if [ "${HAD_ENV}" = 1 ]; then write_tracking deploy.env "${ORIG_ENV}"; else rm -f deploy.env; fi
+          }
+          # Failure before `compose up`: containers were never touched, so NO rollback — just
+          # restore deploy.env and fail the job.
+          abort_before_up() {
+            echo "::error::$1 Running containers were NOT modified."
+            restore_env || echo "::error::deploy.env could not be restored: it may reference ${NEW_TAG} while the containers still run the previous version — fix it manually (see deploy.env.last-good)."
+            exit 1
+          }
+
+          # Stage the Compose files of this commit under the lock.
+          install -m 0644 "${GITHUB_WORKSPACE}/docker-compose.yml"        docker-compose.yml \
+            || abort_before_up "Could not stage docker-compose.yml."
+          install -m 0644 "${GITHUB_WORKSPACE}/docker-compose.server.yml" docker-compose.server.yml \
+            || abort_before_up "Could not stage docker-compose.server.yml."
+
+          echo "Pulling images ${NEW_TAG}..."
+          write_tracking deploy.env "PASSEFILTRE_IMAGE_TAG=${NEW_TAG}" \
+            || abort_before_up "Could not write deploy.env."
+          compose pull || abort_before_up "Pull of ${NEW_TAG} failed."
+
+          echo "Validating merged Compose configuration..."
+          compose config -q || abort_before_up "Invalid Compose configuration."
+
+          # Re-check HEAD of main *immediately* before changing containers: a newer commit may
+          # have landed while the arm64 images were building and pulling. A failed/invalid HEAD
+          # lookup stops the deploy SAFELY: running containers untouched, no rollback.
+          if ! LATEST="$(main_head)" || ! [[ "${LATEST}" =~ ^[0-9a-f]{40}$ ]]; then
+            abort_before_up "Could not resolve HEAD of main before updating containers (network error or invalid response)."
+          fi
+          if [ "${LATEST}" != "${SHA}" ]; then
+            echo "::notice::main advanced to ${LATEST}; a newer deploy will take over. Containers left unchanged."
+            if ! restore_env; then
+              echo "::error::deploy.env could not be restored after stepping aside — fix it manually (see deploy.env.last-good)."
+              exit 1
+            fi
+            exit 0
+          fi
+
+          echo "Updating the passefiltre containers..."
+          compose up -d --remove-orphans || rollback
+
+          echo "Waiting for the API /api/health ..."
+          health_ok   || rollback
+          echo "Waiting for the frontend ..."
+          frontend_ok || rollback
+
+          # Both API and frontend are healthy: record this as the new known-good version. The
+          # deployment is only validated once this reference is durably written; otherwise the
+          # job fails (the previous last-good stays intact thanks to the atomic rename).
+          if ! write_tracking deploy.env.last-good "PASSEFILTRE_IMAGE_TAG=${NEW_TAG}"; then
+            echo "::error::${NEW_TAG} is running and healthy, but deploy.env.last-good could not be recorded. Deployment NOT validated — fix ${DEPLOY_DIR} (permissions/disk space), then re-run this workflow."
+            exit 1
+          fi
+          echo "::notice::PasseFiltre is live on http://${BIND}:${FPORT} (API http://${BIND}:${BPORT}) — ${NEW_TAG}."
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io || true

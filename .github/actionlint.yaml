@@ -1,0 +1,8 @@
+# actionlint configuration.
+# Declares the custom labels of the self-hosted runner on ServeurCasa so actionlint
+# does not flag them as unknown. See .github/workflows/deploy-serveurcasa.yml
+# (runs-on: [self-hosted, Linux, ARM64, passefiltre]).
+self-hosted-runner:
+  labels:
+    - ARM64
+    - passefiltre

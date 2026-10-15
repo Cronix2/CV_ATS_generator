@@ -1,0 +1,38 @@
+# PasseFiltre — production overlay for ServeurCasa (Raspberry Pi 5, linux/arm64).
+#
+# Always used *together* with the base file, never alone:
+#   docker compose -f docker-compose.yml -f docker-compose.server.yml \
+#     --env-file .env --env-file deploy.env <command>
+#
+# Everything else (ports, volumes, security_opt, restart, env_file, shm_size…) is
+# inherited from docker-compose.yml and driven by /opt/passefiltre/.env, so this
+# overlay only does three things:
+#   1. Pin both services to a prebuilt GHCR image for the exact commit (tag = sha-<commit>).
+#      A Docker tag is a mutable pointer, not a cryptographic digest: `sha-<commit>` is
+#      traceable to the commit that produced it, but it is NOT guaranteed immutable.
+#      See docs/deployment-serveurcasa.md (« Tag SHA vs digest ») for the details and
+#      how to verify the published digest manually.
+#   2. Drop the `build:` sections so the Pi can NEVER rebuild an image locally.
+#   3. Lock the Compose project name to `passefiltre` for strict isolation from
+#      the other Docker stacks running on the server.
+#
+# Requires Docker Compose >= 2.24.4 (for the `!reset` tag).
+#
+# PASSEFILTRE_IMAGE_TAG is supplied by /opt/passefiltre/deploy.env, written by the
+# deploy workflow (.github/workflows/deploy-serveurcasa.yml). It holds a `sha-<commit>`
+# tag. The `:?` guard makes Compose refuse to run if it is missing, instead of silently
+# falling back to a mutable tag such as :latest.
+
+name: passefiltre
+
+services:
+  api:
+    # Never build on the Pi: use the arm64 image published by GitHub Actions.
+    build: !reset null
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:?PASSEFILTRE_IMAGE_TAG is required (see /opt/passefiltre/deploy.env)}
+    pull_policy: missing   # commit-pinned tag: pull once, reuse across reboots
+
+  web:
+    build: !reset null
+    image: ghcr.io/cronix2/passefiltre-web:${PASSEFILTRE_IMAGE_TAG:?PASSEFILTRE_IMAGE_TAG is required (see /opt/passefiltre/deploy.env)}
+    pull_policy: missing
