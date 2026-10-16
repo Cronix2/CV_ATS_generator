@@ -136,8 +136,8 @@ def _failures_api(forbid_urls: list[str]) -> list[str]:
                     if not refused:
                         failures.append(f"the CAPTCHA browser loaded {url} (HTTP {response and response.status})")
             for attempt in (1, 2):  # LinkedIn itself may reset a runner's connection once
+                # Same page: a second new_page() (no timeout in Playwright) hung on the CI runners.
                 with step(f"must load {ALLOWED_URL} (attempt {attempt})", 60):
-                    page = session.context.new_page()
                     try:
                         response = page.goto(ALLOWED_URL, timeout=30_000)
                     except Exception as e:
