@@ -17,6 +17,7 @@ from app.scraper import captcha, linkedin
 from app.security import PublicError
 
 UI = "http://localhost:3000"  # default CORS_ORIGINS
+WS = "ws://localhost"  # websocket_connect ignores base_url; the Host must be allowed
 needs_unix_sockets = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets (Linux, Docker image)")
 
 
@@ -173,13 +174,13 @@ def ticket(client, job) -> list[str]:
 @needs_unix_sockets
 def test_viewer_reaches_only_its_own_display(client, fake_vnc):
     job, other = captcha_job(FakeDisplay(fake_vnc)), captcha_job(FakeDisplay(fake_vnc))
-    url = f"/api/jobs/{job.id}/captcha/vnc"
+    url = f"{WS}/api/jobs/{job.id}/captcha/vnc"
     for protocols, headers, target in [
         (ticket(client, job), {"origin": "https://evil.example"}, url),   # cross-site WebSocket hijacking
         (ticket(client, job), {}, url),                                   # no Origin
         (["binary"], {"origin": UI}, url),                                # no ticket
         (ticket(client, other), {"origin": UI}, url),                     # someone else's ticket
-        (ticket(client, job), {"origin": UI}, f"/api/jobs/{other.id}/captcha/vnc"),
+        (ticket(client, job), {"origin": UI}, f"{WS}/api/jobs/{other.id}/captcha/vnc"),
     ]:
         with pytest.raises(WebSocketDisconnect) as refused:
             with client.websocket_connect(target, subprotocols=protocols, headers=headers):
@@ -200,7 +201,7 @@ def test_viewer_reaches_only_its_own_display(client, fake_vnc):
 @needs_unix_sockets
 def test_viewer_is_cut_when_the_captcha_session_ends(client, fake_vnc):
     job = captcha_job(FakeDisplay(fake_vnc))
-    with client.websocket_connect(f"/api/jobs/{job.id}/captcha/vnc", subprotocols=ticket(client, job),
+    with client.websocket_connect(f"{WS}/api/jobs/{job.id}/captcha/vnc", subprotocols=ticket(client, job),
                                   headers={"origin": UI}) as ws:
         assert ws.receive_bytes().startswith(b"RFB ")
         threading.Timer(0.2, job.captcha_closed).start()  # solved / expired / cancelled
