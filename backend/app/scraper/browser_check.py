@@ -78,8 +78,22 @@ def launch_check() -> None:
     _check_page(page)
 
 
+def _readable(entry: str) -> str:
+    """'0100007F:170C' / '000...01000000:170C' from /proc/net/tcp* -> '127.0.0.1:5900' / '[::1]:5900'."""
+    addr, port = entry.split(":")
+    raw = bytes.fromhex(addr)
+    raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))  # 32-bit words, host byte order
+    host = socket.inet_ntop(socket.AF_INET6 if len(raw) == 16 else socket.AF_INET, raw)
+    return f"[{host}]:{int(port, 16)}" if len(raw) == 16 else f"{host}:{int(port, 16)}"
+
+
 def _tcp_listeners() -> set[str]:
-    """Listening TCP sockets of this network namespace (Linux /proc)."""
+    """Listening TCP sockets of this network namespace (Linux /proc).
+
+    Any new one fails the check, loopback included: the VNC server has no password (access control
+    is the API ticket in front of the Unix socket), so even 127.0.0.1 / ::1 would let any local
+    process bypass it.
+    """
     found = set()
     for name in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
@@ -113,7 +127,7 @@ def display_check() -> None:
                 if not banner.startswith(b"RFB "):
                     raise RuntimeError(f"no VNC banner on the Unix socket (got {banner!r})")
                 if opened:
-                    raise RuntimeError(f"the VNC server opened TCP ports: {sorted(opened)}")
+                    raise RuntimeError(f"the VNC server opened TCP ports: {sorted(map(_readable, opened))}")
     finally:
         server.shutdown()
     if workdir is not None and workdir.exists():
