@@ -15,7 +15,8 @@ import socket
 import sys
 from pathlib import Path
 
-ALLOWED_URL = "https://www.linkedin.com/robots.txt"
+# Plain HTTP on purpose: Chromium must upgrade it (HSTS) since the proxy only tunnels HTTPS.
+ALLOWED_URL = "http://www.linkedin.com/"
 # Must never load in the human-driven browser: other services, private/LAN, metadata, non-allowlisted.
 FORBIDDEN_URLS = [
     "http://api:8000/api/health",
@@ -26,7 +27,6 @@ FORBIDDEN_URLS = [
     "http://192.168.1.1/",
     "https://10.0.0.1/",
     "https://example.com/",
-    "http://www.linkedin.com/",  # plain HTTP
     "file:///etc/passwd",
 ]
 # Raw TCP from the sidecar (what a compromised Chromium could try): internet, metadata, LAN, host.
@@ -87,12 +87,21 @@ def _failures_api(forbid_urls: list[str]) -> list[str]:
                     continue  # tunnel refused / unreachable: expected
                 if response is not None and response.headers.get("x-passefiltre-egress") != "refused":
                     failures.append(f"the CAPTCHA browser loaded {url} (HTTP {response.status})")
-            try:
-                response = page.goto(ALLOWED_URL, timeout=30_000)
+            for _ in range(2):  # LinkedIn itself may reset a runner's connection once
+                page = session.context.new_page()
+                try:
+                    response = page.goto(ALLOWED_URL, timeout=30_000)
+                except Exception as e:
+                    error = f"{ALLOWED_URL} unreachable through the proxy: {e}"
+                    continue
+                error = None
                 if response is None or response.headers.get("x-passefiltre-egress"):
-                    failures.append(f"{ALLOWED_URL} was not loaded through the proxy")
-            except Exception as e:
-                failures.append(f"{ALLOWED_URL} unreachable through the proxy: {e}")
+                    error = f"{ALLOWED_URL} was not loaded through the proxy"
+                elif not response.url.startswith("https://"):
+                    error = f"{ALLOWED_URL} was loaded over plain HTTP"
+                break
+            if error:
+                failures.append(error)
         remote.start_vnc()
         workdir = Path(remote.vnc_socket or "").parent
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as vnc:

@@ -605,7 +605,9 @@ Liste blanche par défaut (domaine et sous-domaines) : `linkedin.com`,
 `licdn.com`, `arkoselabs.com`, `funcaptcha.com`, `www.google.com`,
 `www.gstatic.com`, `www.recaptcha.net`. Si un CAPTCHA reste blanc :
 `docker compose -p passefiltre logs captcha-egress` liste chaque refus
-(`refused <hôte>:443: host not in the allowlist`).
+(`refused <hôte>:443: host not in the allowlist`). Les refus de
+`accounts.google.com`, `update.googleapis.com`, `android.clients.google.com` et
+`clients2.google.com` sont le bruit de fond de Chromium : normaux.
 
 `CORS_ORIGINS` doit contenir `https://passefiltre.local.cronix.fr` (déjà requis
 par §2bis).
