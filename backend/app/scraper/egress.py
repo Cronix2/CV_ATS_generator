@@ -27,8 +27,17 @@ DEFAULT_DOMAINS = (
 )
 MAX_CLIENTS = 128
 TIMEOUT = 10
-REFUSED = b"HTTP/1.1 403 Forbidden\r\nX-PasseFiltre-Egress: refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-FAILED = b"HTTP/1.1 502 Bad Gateway\r\nX-PasseFiltre-Egress: refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+
+
+def _answer(status: str) -> bytes:
+    # A body so that Chromium shows the answer (with its header) instead of a bare network error.
+    body = b"Refused by the PasseFiltre egress proxy.\n"
+    return (f"HTTP/1.1 {status}\r\nX-PasseFiltre-Egress: refused\r\nContent-Type: text/plain\r\n"
+            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body
+
+
+REFUSED = _answer("403 Forbidden")
+FAILED = _answer("502 Bad Gateway")
 
 
 def allowed_domains() -> tuple[str, ...]:
