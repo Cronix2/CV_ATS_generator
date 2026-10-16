@@ -110,53 +110,49 @@ def _failures_api(forbid_urls: list[str]) -> list[str]:
 
     from app.scraper import captcha
 
-    failures = []
-    with step("open an isolated browser session", 90):
-        remote = captcha.RemoteBrowser().__enter__()
-    try:
-        with step("connect over CDP", 60):
-            session = StealthySession(cdp_url=remote.cdp_url, timeout=30_000, retries=1, google_search=False,
-                                      additional_args=remote.context_options()).__enter__()
-            session.context.set_default_timeout(20_000)
-        try:
-            with step("new page", 30):
+    def visit(url: str, timeout_ms: int) -> tuple[tuple | None, str | None]:
+        """Load url in a fresh isolated session, as in production (one page per Chromium): on a reused
+        page, late error pages interrupt the next navigation, and a second new_page() hung on CI."""
+        with captcha.RemoteBrowser() as remote:
+            log("  isolated session opened")
+            with StealthySession(cdp_url=remote.cdp_url, timeout=30_000, retries=1, google_search=False,
+                                 additional_args=remote.context_options()) as session:
                 page = session.context.new_page()
-            for url in FORBIDDEN_URLS + forbid_urls:
-                with step(f"must not load {url}", 25):
-                    try:
-                        response = page.goto(url, timeout=15_000)
-                    except Exception as e:
-                        reason = str(e).splitlines()[0]
-                        log(f"  -> {reason}")
-                        if not any(b in reason for b in BLOCKED_ERRORS):  # incl. timeout: not proven blocked
-                            failures.append(f"could not verify that {url} is blocked: {reason}")
-                        continue
-                    refused = response is not None and response.headers.get("x-passefiltre-egress") == "refused"
-                    log(f"  -> HTTP {response.status if response else None}, refused by egress: {refused}")
-                    if not refused:
-                        failures.append(f"the CAPTCHA browser loaded {url} (HTTP {response and response.status})")
-            for attempt in (1, 2):  # LinkedIn itself may reset a runner's connection once
-                # Same page: a second new_page() (no timeout in Playwright) hung on the CI runners.
-                with step(f"must load {ALLOWED_URL} (attempt {attempt})", 60):
-                    try:
-                        response = page.goto(ALLOWED_URL, timeout=30_000)
-                    except Exception as e:
-                        error = f"{ALLOWED_URL} unreachable through the proxy: {str(e).splitlines()[0]}"
-                        log(f"  -> {error}")
-                        continue
-                    log(f"  -> HTTP {response and response.status} {response and response.url}")
-                    error = None
-                    if response is None or response.headers.get("x-passefiltre-egress"):
-                        error = f"{ALLOWED_URL} was not loaded through the proxy"
-                    elif not response.url.startswith("https://"):
-                        error = f"{ALLOWED_URL} was loaded over plain HTTP"
-                    break
+                log("  CDP connected, page ready")
+                try:
+                    r = page.goto(url, timeout=timeout_ms)
+                    return (r and r.status, r and r.headers.get("x-passefiltre-egress"), r and r.url), None
+                except Exception as e:
+                    return None, str(e).splitlines()[0]
+                finally:
+                    log("  navigation over, closing")
+
+    failures = []
+    for url in FORBIDDEN_URLS + forbid_urls:
+        with step(f"must not load {url}", 60):
+            answer, error = visit(url, 15_000)
+            log(f"  -> {error or answer}")
             if error:
-                failures.append(error)
-        finally:
-            with step("disconnect CDP", 60):
-                session.__exit__(None, None, None)
-        with step("VNC over the shared Unix socket", 90):
+                if not any(b in error for b in BLOCKED_ERRORS):  # incl. timeout: not proven blocked
+                    failures.append(f"could not verify that {url} is blocked: {error}")
+            elif answer[1] != "refused":
+                failures.append(f"the CAPTCHA browser loaded {url} (HTTP {answer[0]})")
+    for attempt in (1, 2):  # LinkedIn itself may reset a runner's connection once
+        with step(f"must load {ALLOWED_URL} (attempt {attempt})", 90):
+            answer, error = visit(ALLOWED_URL, 30_000)
+            log(f"  -> {error or answer}")
+            if error:
+                error = f"{ALLOWED_URL} unreachable through the proxy: {error}"
+                continue
+            if answer[1] or answer[0] is None:
+                error = f"{ALLOWED_URL} was not loaded through the proxy"
+            elif not answer[2].startswith("https://"):
+                error = f"{ALLOWED_URL} was loaded over plain HTTP"
+            break
+    if error:
+        failures.append(error)
+    with step("VNC over the shared Unix socket", 120):
+        with captcha.RemoteBrowser() as remote:
             remote.start_vnc()
             workdir = Path(remote.vnc_socket or "").parent
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as vnc:
@@ -165,15 +161,9 @@ def _failures_api(forbid_urls: list[str]) -> list[str]:
                 if not vnc.recv(12).startswith(b"RFB "):
                     failures.append("no VNC banner on the shared Unix socket")
             remote.stop_vnc()
-    finally:
-        with step("close the isolated browser session", 90):
-            remote.__exit__(None, None, None)
-    if workdir.exists():
-        failures.append("the session directory was not removed from the shared volume")
-    with step("open and close a second session", 180):
-        with captcha.RemoteBrowser() as again:  # the single slot was released
-            if not again.id:
-                failures.append("a new session could not be opened after closing the first one")
+        if workdir.exists():
+            failures.append("the session directory was not removed from the shared volume")
+    # Each visit opened a new session after closing the previous one: the single slot is released.
     return failures
 
 
