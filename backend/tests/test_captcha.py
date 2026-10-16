@@ -1,14 +1,17 @@
 """Remote CAPTCHA solving: job ownership, viewer tickets, WebSocket bridge, scraper lifecycle."""
 
+import math
 import os
 import socket
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from app import jobs, main
 from app.main import app
@@ -141,12 +144,14 @@ def test_ticket_is_single_use_bound_to_its_job_and_short_lived(monkeypatch):
 
 @pytest.fixture
 def fake_vnc():
-    """A VNC-like server on a Unix socket: sends the RFB banner, then echoes."""
+    """A VNC-like server on a Unix socket: sends the RFB banner, then echoes. `hung_up` is released
+    each time a bridge closes its connection."""
     folder = tempfile.mkdtemp(prefix="pfv")
     path = os.path.join(folder, "s")
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(path)
     server.listen(4)
+    hung_up = threading.Semaphore(0)
 
     def serve():
         while True:
@@ -156,11 +161,15 @@ def fake_vnc():
                 return
             with conn:
                 conn.sendall(b"RFB 003.008\n")
-                while data := conn.recv(1024):
-                    conn.sendall(data)
+                try:
+                    while data := conn.recv(1024):
+                        conn.sendall(data)
+                except ConnectionError:
+                    pass
+            hung_up.release()
 
     threading.Thread(target=serve, daemon=True).start()
-    yield path
+    yield SimpleNamespace(path=path, hung_up=hung_up)
     server.close()
     os.unlink(path)
     os.rmdir(folder)
@@ -173,7 +182,7 @@ def ticket(client, job) -> list[str]:
 
 @needs_unix_sockets
 def test_viewer_reaches_only_its_own_display(client, fake_vnc):
-    job, other = captcha_job(FakeDisplay(fake_vnc)), captcha_job(FakeDisplay(fake_vnc))
+    job, other = captcha_job(FakeDisplay(fake_vnc.path)), captcha_job(FakeDisplay(fake_vnc.path))
     url = f"{WS}/api/jobs/{job.id}/captcha/vnc"
     for protocols, headers, target in [
         (ticket(client, job), {"origin": "https://evil.example"}, url),   # cross-site WebSocket hijacking
@@ -200,13 +209,72 @@ def test_viewer_reaches_only_its_own_display(client, fake_vnc):
 
 @needs_unix_sockets
 def test_viewer_is_cut_when_the_captcha_session_ends(client, fake_vnc):
-    job = captcha_job(FakeDisplay(fake_vnc))
+    job = captcha_job(FakeDisplay(fake_vnc.path))
     with client.websocket_connect(f"{WS}/api/jobs/{job.id}/captcha/vnc", subprotocols=ticket(client, job),
                                   headers={"origin": UI}) as ws:
         assert ws.receive_bytes().startswith(b"RFB ")
         threading.Timer(0.2, job.captcha_closed).start()  # solved / expired / cancelled
         with pytest.raises(WebSocketDisconnect):
             ws.receive_bytes()
+
+
+@needs_unix_sockets
+def test_text_frame_ends_the_session_as_a_protocol_error(client, fake_vnc):
+    job = captcha_job(FakeDisplay(fake_vnc.path))
+    with client.websocket_connect(f"{WS}/api/jobs/{job.id}/captcha/vnc", subprotocols=ticket(client, job),
+                                  headers={"origin": UI}) as ws:
+        assert ws.receive_bytes().startswith(b"RFB ")
+        ws.send_text("not RFB")
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_bytes()
+        assert closed.value.code == 1003
+    assert fake_vnc.hung_up.acquire(timeout=5)
+
+
+async def bridge_cancelled_by_its_owner(job: jobs.Job, after_ticks: int, browser_leaves: bool) -> list[dict]:
+    """Runs the bridge inside an anyio CancelScope owned by its caller, as the ASGI server (and the
+    TestClient) do, and cancels that scope `after_ticks` scheduler ticks once the session is live
+    (browser_leaves=False: server shutdown) or once the browser has hung up (True: the race where the
+    caller cancels while the bridge is still cleaning up). Returns the ASGI messages sent."""
+    inbox_tx, inbox = anyio.create_memory_object_stream(math.inf)
+    sent: list[dict] = []
+    live = anyio.Event()
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+        if message.get("bytes", b"").startswith(b"RFB "):  # VNC banner relayed: the session is up
+            if browser_leaves:
+                inbox_tx.send_nowait({"type": "websocket.disconnect", "code": 1001})
+            live.set()
+
+    async def cancel_later(owner: anyio.CancelScope) -> None:
+        await live.wait()
+        for _ in range(after_ticks):
+            await anyio.lowlevel.checkpoint()
+        owner.cancel()
+
+    scope = {"type": "websocket", "path": f"/api/jobs/{job.id}/captcha/vnc", "headers": [(b"origin", UI.encode())],
+             "subprotocols": ["binary", main.TICKET_PROTOCOL + job.issue_ticket()], "client": ("testclient", 50000)}
+    inbox_tx.send_nowait({"type": "websocket.connect"})
+    async with anyio.create_task_group() as tg:
+        with anyio.CancelScope() as owner:
+            tg.start_soon(cancel_later, owner)
+            await main.captcha_vnc(WebSocket(scope, inbox.receive, send), job.id)
+            await anyio.sleep_forever()  # the bridge returned first: wait for the owner's cancel
+        # Only the owner's own cancellation may end the scope: a foreign CancelledError escaping the
+        # bridge would propagate from here (and the TestClient reports it as a cancelled future).
+        assert owner.cancelled_caught
+    return sent
+
+
+@needs_unix_sockets
+@pytest.mark.parametrize("browser_leaves", [False, True], ids=["server-shutdown", "browser-left"])
+def test_bridge_cancellation_stays_with_its_owner_and_closes_both_ends(fake_vnc, browser_leaves):
+    job = captcha_job(FakeDisplay(fake_vnc.path))
+    for after_ticks in range(25):  # sweep the cancellation across the session and its cleanup
+        sent = anyio.run(bridge_cancelled_by_its_owner, job, after_ticks, browser_leaves)
+        assert sent[0]["type"] == "websocket.accept" and sent[-1]["type"] == "websocket.close", after_ticks
+        assert fake_vnc.hung_up.acquire(timeout=5), f"VNC connection left open (cancelled after {after_ticks} ticks)"
 
 
 # --- Cycle de vie côté scraper -----------------------------------------------------------------------

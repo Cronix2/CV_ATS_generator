@@ -1,16 +1,18 @@
 import asyncio
+import contextlib
 import logging
 import os
 import re
 import unicodedata
 from urllib.parse import urlparse
 
+import anyio
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from app import jobs
 from app.export.content import build
@@ -172,6 +174,7 @@ def job_code(job_id: str, req: CodeRequest, request: Request):
 # --------------------------------------------------------------------------- CAPTCHA viewer
 
 TICKET_PROTOCOL = "pf-ticket."  # the ticket travels as a WebSocket sub-protocol: never in a URL (logs)
+VNC_CLOSE_TIMEOUT = 5  # seconds to release both ends of the bridge, even when cancelled
 
 
 @app.post("/api/jobs/{job_id}/captcha/ticket")
@@ -208,12 +211,16 @@ async def captcha_vnc(ws: WebSocket, job_id: str):
     except (OSError, AttributeError, NotImplementedError):
         await ws.close(code=1011)
         return
-    await ws.accept(subprotocol="binary" if "binary" in offered else None)
-    audit(ws, "captcha_vnc_open", job=job.id)
 
     async def to_vnc() -> None:
         while True:
-            data = await ws.receive_bytes()
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+            data = message.get("bytes")
+            if data is None:  # RFB is binary only: a text frame is a protocol error
+                await ws.close(code=1003)
+                return
             writer.write(data)
             await writer.drain()
 
@@ -223,20 +230,34 @@ async def captcha_vnc(ws: WebSocket, job_id: str):
 
     async def until_closed() -> None:  # solved, expired or cancelled: cut the viewer even if VNC lingers
         while job.status == "needs_captcha" and job.display is display:
-            await asyncio.sleep(1)
+            await anyio.sleep(1)
 
-    tasks = [asyncio.create_task(t()) for t in (to_vnc, to_browser, until_closed)]
+    # Structured concurrency (anyio, like Starlette itself): a cancellation of this handler (client
+    # gone, server shutdown) reaches the pumps and leaves as the canceller's own cancellation, never
+    # as a stray CancelledError; an unexpected pump error propagates instead of being swallowed.
     try:
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        await ws.accept(subprotocol="binary" if "binary" in offered else None)
+        audit(ws, "captcha_vnc_open", job=job.id)
+        async with anyio.create_task_group() as pumps:
+            async def pump(side) -> None:
+                try:
+                    await side()
+                except (WebSocketDisconnect, ConnectionError):
+                    pass  # the browser or the VNC server hung up: the normal end of a session
+                pumps.cancel_scope.cancel()  # whichever side ends first ends the whole bridge
+
+            for side in (to_vnc, to_browser, until_closed):
+                pumps.start_soon(pump, side)
     finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        writer.close()
-        try:
-            await ws.close()
-        except (RuntimeError, WebSocketDisconnect):
-            pass
+        # Release both ends even if this handler is being cancelled: shielded, but bounded so a
+        # stuck peer cannot hold the handler.
+        with anyio.move_on_after(VNC_CLOSE_TIMEOUT, shield=True):
+            writer.close()
+            with contextlib.suppress(OSError):  # the VNC server may already have reset the socket
+                await writer.wait_closed()
+            if ws.application_state is WebSocketState.CONNECTED:
+                with contextlib.suppress(WebSocketDisconnect):  # the browser is already gone
+                    await ws.close()
         audit(ws, "captcha_vnc_close", job=job.id)
 
 
