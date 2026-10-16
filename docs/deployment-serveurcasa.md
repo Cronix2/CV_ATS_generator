@@ -488,42 +488,88 @@ test exécuté sur le Pi.
   `/mnt/storageplex` et `/mnt/backup8to`.
 
 Depuis l'ajout du CAPTCHA à distance (§13), le même `browser_check` démarre
-aussi Chromium **en mode visible sur un écran Xvfb privé**, lance x11vnc sur un
-socket Unix, lit la bannière RFB, vérifie qu'**aucun port TCP** n'a été ouvert
-et que le répertoire temporaire a été supprimé.
+aussi le navigateur du service `captcha-browser` **tel qu'il y est lancé**
+(profil neuf, mode visible sur un écran Xvfb privé, piloté en CDP), lance
+x11vnc sur un socket Unix, lit la bannière RFB, vérifie qu'**aucun port TCP**
+n'a été ouvert et que l'écran et le profil ont été supprimés.
+
+Son isolement réseau ne peut se vérifier qu'avec les vrais services : dans
+`ci.yml` (amd64 **et** arm64), `.github/scripts/captcha-isolation.sh` démarre
+`api`, `captcha-browser` et `captcha-egress` avec `docker-compose.yml` (projet
+`pfci`, supprimé ensuite) et lance `python -m app.scraper.isolation_check`
+(§13, « Isolation du navigateur »). Ce test n'est **pas** rejoué sur le Pi.
 
 ## 13. Résolution manuelle des CAPTCHA LinkedIn (noVNC)
 
 ### Architecture
 
-Tout se passe **dans le conteneur `api`** : aucun nouveau service, aucun port
-publié en plus de `8100`.
+Le navigateur qu'un humain pilote ne tourne **jamais dans le conteneur `api`**
+(qui détient le jeton, les clés LLM et les profils LinkedIn de tous les
+comptes) : il vit dans un service à part, `captcha-browser`, qui ne sort que
+par `captcha-egress`. Aucun port publié en plus de `8100`.
 
 ```text
-navigateur ──HTTPS/WSS──> NPM ──HTTP/WS──> api:8000  /api/jobs/{id}/captcha/vnc  (pont WebSocket FastAPI)
-                                               │ socket Unix 0700 (pas de TCP)
-                                               ▼
-                                     x11vnc ──> Xvfb :N (écran privé, -nolisten tcp)
-                                                  ▲
-                                     Chromium visible (même profil LinkedIn)
+navigateur ──HTTPS/WSS──> NPM ──> api:8000 /api/jobs/{id}/captcha/vnc (pont WebSocket)
+                                   │  │ socket Unix 0700, volume captcha-run (pas de TCP)
+                 réseau « captcha »│  ▼
+          (internal, sans passerelle) captcha-browser : x11vnc ──> Xvfb ──> Chromium (profil neuf)
+                                   │        │ CDP :9222 + contrôle :9300 (réseau captcha seulement)
+                                   │        ▼ proxy HTTP CONNECT :3128
+                                   └──── captcha-egress ──> Internet : HTTPS:443, liste blanche, IP publiques
 ```
 
-1. L'extraction démarre **sans interface** (headless, comportement inchangé).
-2. Si LinkedIn affiche un CAPTCHA, elle est relancée **une fois** en mode
-   visible sur un écran virtuel Xvfb privé (numéro choisi par Xvfb,
-   `-displayfd`), avec le même profil persistant.
+1. L'extraction démarre **sans interface** dans `api` (headless, comportement
+   inchangé, profil persistant du compte).
+2. Si LinkedIn affiche un CAPTCHA — après le formulaire **ou directement à la
+   place de `/login`** (compte sous surveillance) — l'API ouvre une session
+   dans `captcha-browser` : Xvfb privé + Chromium avec un **profil temporaire
+   neuf**, piloté en CDP. La connexion y est rejouée ; **ce même navigateur
+   reste ouvert** pendant l'intervention humaine (code par e-mail compris).
 3. Quand le CAPTCHA apparaît, x11vnc démarre sur un **socket Unix** dans un
-   répertoire temporaire `0700` (`-rfbport 0 -rfbportv6 0 -no6` : aucun port TCP, pas même
-   en loopback IPv4/IPv6 ; le test navigateur échoue sinon). La tâche passe
-   à l'état `needs_captcha` ; l'interface affiche « Résoudre le CAPTCHA ».
-4. Le bouton ouvre une fenêtre intégrée (noVNC) reliée au pont WebSocket de
-   l'API, qui joue le rôle de websockify.
-5. La reprise est décidée **uniquement côté serveur** : le scraping continue
-   lorsque LinkedIn quitte `/checkpoint` ou `/challenge`. Ouvrir ou fermer la
-   fenêtre ne valide rien. Aucune résolution automatique n'est tentée.
-6. À la fin (succès, expiration, annulation, erreur), x11vnc et Xvfb sont
-   arrêtés (groupe de processus entier) et le répertoire temporaire supprimé ;
-   les connexions noVNC ouvertes sont coupées.
+   répertoire `0700` du volume `captcha-run` (`-rfbport 0 -rfbportv6 0 -no6` :
+   aucun port TCP). La tâche passe à `needs_captcha` ; l'interface affiche
+   « Résoudre le CAPTCHA ».
+4. Le bouton ouvre la fenêtre noVNC reliée au pont WebSocket de l'API
+   (rôle de websockify). L'API n'ouvre que des sockets situés dans le volume
+   partagé.
+5. La reprise est décidée **uniquement côté serveur** : quand LinkedIn quitte
+   `/checkpoint` ou `/challenge`. Seuls les **cookies `linkedin.com`** (champs
+   connus, taille bornée, `li_at` exigé) reviennent à l'API, qui reprend
+   l'extraction **headless** dans le profil du compte. Si LinkedIn redemande
+   une vérification juste après : message « réessayez dans quelques minutes ».
+6. À la fin (succès, expiration, annulation, erreur), Chromium, x11vnc et Xvfb
+   sont tués (groupe de processus), le profil et le répertoire du socket
+   supprimés, les connexions noVNC coupées. `captcha-browser` ferme aussi
+   d'office une session de plus de `CAPTCHA_TIMEOUT + 600` s et vide ses
+   restes au démarrage.
+
+Sans le service `captcha-browser` (`CAPTCHA_BROWSER_URL` absent, lanceur local
+par exemple), la fonction est **désactivée** : retour au message « relancez avec
+Afficher le navigateur ».
+
+### Isolation du navigateur
+
+Risques réels d'un navigateur piloté à distance, et parade :
+
+| Risque (si le navigateur tournait dans `api`) | Parade |
+| --- | --- |
+| Lire les profils/cookies LinkedIn des autres comptes et le secret HMAC (`/app/.sessions`) | volume **non monté** dans `captcha-browser` ; profil neuf par session, en `/tmp` du conteneur, supprimé ensuite |
+| Lire le jeton et les clés LLM (environnement, `/proc/1/environ` via `file://`) | pas d'`env_file` ; Chromium ne reçoit que `DISPLAY`, `HOME`, `PATH` ; politique Chromium : `file://` bloqué, pas de sélecteur de fichiers (upload), pas de téléchargement |
+| Atteindre le NAS, le LAN (`192.168.1.x`, admin NPM), les ports publiés des autres stacks, les métadonnées (`169.254.169.254`) | réseau `captcha` **`internal`** + `inhibit_ipv4` : ni route sortante ni adresse de passerelle sur l'hôte ; seul `captcha-egress` sort |
+| Utiliser le proxy pour rebondir vers l'intérieur | `captcha-egress` : `CONNECT` vers le port 443 uniquement, liste blanche de noms (pas d'IP littérale), résolution DNS par le proxy, **refus si une adresse n'est pas publique**, connexion à l'adresse vérifiée (pas de DNS rebinding) |
+| Atteindre le CDP / contrôle depuis la page | `--proxy-bypass-list=<-loopback>` : même `localhost` passe par le proxy, qui refuse |
+| Exploit Chromium (lancé `--no-sandbox`) | confiné au conteneur : aucune capacité Linux (`cap_drop: ALL`), `no-new-privileges`, utilisateur 10001, `mem_limit`, `pids_limit` |
+
+Pourquoi un conteneur et pas seulement un profil distinct : dans `api`, un
+profil séparé laisse le même utilisateur, le même système de fichiers et le
+même réseau ; une séparation d'utilisateurs y est impossible
+(`no-new-privileges`, espaces de noms refusés par le seccomp de Docker), et
+les politiques Chromium ne sont qu'une défense en profondeur.
+
+Contraintes ARM64 / Pi : même image multi-arch (aucune image tierce), un seul
+Chromium visible à la fois, réseaux et volume créés **dans le projet
+`passefiltre`** uniquement — aucun autre conteneur du NAS ne les rejoint et les
+règles iptables de Docker ne concernent que ce pont.
 
 ### Contrôle d'accès
 
@@ -541,6 +587,9 @@ navigateur ──HTTPS/WSS──> NPM ──HTTP/WS──> api:8000  /api/jobs/{
   contre le détournement inter-sites) ; refus = fermeture `1008`, journalisé
   (`captcha_vnc_refused`).
 - `ALLOWED_HOSTS` s'applique aussi au WebSocket.
+- L'interface de contrôle de `captcha-browser` (`:9300`) et son CDP (`:9222`)
+  n'existent que sur le réseau `captcha` (ni publiés, ni joignables depuis la
+  page) ; une session n'est pilotable qu'avec son identifiant aléatoire.
 
 ### Variables d'environnement (`/opt/passefiltre/.env`, toutes facultatives)
 
@@ -548,8 +597,15 @@ navigateur ──HTTPS/WSS──> NPM ──HTTP/WS──> api:8000  /api/jobs/{
 | --- | --- | --- |
 | `INTERACTIVE_CAPTCHA` | `1` | `0` = désactive (retour au message « relancez en mode visible ») |
 | `CAPTCHA_TIMEOUT` | `300` | secondes laissées pour résoudre (minimum 60) |
-| `MAX_CAPTCHA_SESSIONS` | `1` | écrans virtuels simultanés (au-delà : message d'attente) |
+| `CAPTCHA_MEM_LIMIT` | `1536m` | plafond mémoire de `captcha-browser` |
+| `CAPTCHA_ALLOWED_DOMAINS` | *(vide)* | domaines HTTPS ajoutés à la liste blanche (séparés par des virgules) |
 | `API_MEM_LIMIT` | `3g` | plafond mémoire du conteneur `api` |
+
+Liste blanche par défaut (domaine et sous-domaines) : `linkedin.com`,
+`licdn.com`, `arkoselabs.com`, `funcaptcha.com`, `www.google.com`,
+`www.gstatic.com`, `www.recaptcha.net`. Si un CAPTCHA reste blanc :
+`docker compose -p passefiltre logs captcha-egress` liste chaque refus
+(`refused <hôte>:443: host not in the allowlist`).
 
 `CORS_ORIGINS` doit contenir `https://passefiltre.local.cronix.fr` (déjà requis
 par §2bis).
@@ -577,25 +633,66 @@ Vérification : pendant un CAPTCHA, outils de développement → Réseau → WS 
 
 ### Ressources du Raspberry Pi 5
 
-- Une seule session d'écran virtuel par défaut ; un seul scraping par compte
-  LinkedIn ; au plus 2 tâches en parallèle (inchangé).
-- `docker-compose.yml` : `init: true` (récupère les processus orphelins de
-  Chromium), `pids_limit: 512`, `mem_limit: ${API_MEM_LIMIT:-3g}`. Si le cgroup
-  mémoire est désactivé sur le Pi, Docker l'ignore avec un avertissement
-  (activable via `cgroup_enable=memory` dans `/boot/firmware/cmdline.txt`,
-  non fait par ce dépôt).
-- L'image grossit de quelques dizaines de Mo (`xvfb`, `x11vnc`).
+- Une seule session `captcha-browser` à la fois (une seconde reçoit « une autre
+  résolution est en cours ») ; un seul scraping par compte LinkedIn ; au plus
+  2 tâches en parallèle (inchangé).
+- `docker-compose.yml` : `init: true` partout ; `api` : `pids_limit: 512`,
+  `mem_limit: ${API_MEM_LIMIT:-3g}` ; `captcha-browser` : `pids_limit: 256`,
+  `mem_limit: ${CAPTCHA_MEM_LIMIT:-1536m}` ; `captcha-egress` : 128 Mo,
+  système de fichiers en lecture seule. Au repos, `captcha-browser` et
+  `captcha-egress` ne font tourner qu'un petit processus Python chacun ;
+  pendant un CAPTCHA, la connexion headless de l'API est déjà fermée (un seul
+  Chromium à la fois pour ce compte). Si le cgroup mémoire est désactivé sur le
+  Pi, Docker ignore les plafonds avec un avertissement
+  (`cgroup_enable=memory` dans `/boot/firmware/cmdline.txt`, non fait ici).
+- L'image grossit de quelques dizaines de Mo (`xvfb`, `x11vnc`) ; les trois
+  services utilisent **la même image**.
 
 ### Déploiement
 
-Aucune étape manuelle côté Docker : le workflow habituel (§3 à §5) suffit. À
-faire **une fois** avant de l'utiliser : l'option WebSockets dans NPM
-(ci-dessus). Rollback : §7 (l'ancienne image ignore simplement ces variables).
+Aucune étape manuelle côté Docker : le workflow habituel (§3 à §5) tire
+l'image et crée les deux services, le réseau `passefiltre_captcha` et le volume
+`passefiltre_captcha-run`. À faire **une fois** avant de l'utiliser : l'option
+WebSockets dans NPM (ci-dessus).
 
-### Limites
+Rollback (§7) vers une image **antérieure** à ce changement : les fichiers
+Compose restent ceux du nouveau commit, donc `captcha-browser` et
+`captcha-egress` redémarreraient en boucle (module absent) sans gêner `api`
+ni `web`. Les arrêter :
+`docker compose -p passefiltre stop captcha-browser captcha-egress`.
 
-- La reprise relance l'extraction en mode visible depuis le début (la session
-  headless n'est pas transférable) ; le profil persistant conserve les cookies.
+### Limites résiduelles
+
+- **Accès réseau interne du conteneur isolé** : depuis `captcha-browser`, un
+  processus compromis (pas la page, qui passe par le proxy) peut joindre
+  `api:8000` (protégée par le jeton, sauf `/api/health` et la configuration
+  publique) et `captcha-egress:3128` (qui applique la liste blanche).
+- **Chromium sans bac à sable** (`--no-sandbox`, imposé par le seccomp de
+  Docker) : un exploit du moteur de rendu prend le conteneur, mais n'y trouve ni
+  secret, ni session, ni réseau.
+- **Scraping headless** : il tourne toujours dans `api`, avec accès aux
+  sessions et au réseau, mais il n'est jamais piloté par un humain ; seules des
+  pages `linkedin.com` y sont chargées.
+- **Cookies rapatriés** : un `captcha-browser` compromis pourrait injecter des
+  cookies `linkedin.com` (bornés) dans le profil du compte concerné, rien
+  d'autre. LinkedIn peut aussi refuser des cookies créés ailleurs et
+  redemander une vérification.
+- **Liste blanche** : si LinkedIn change de fournisseur de CAPTCHA, le
+  CAPTCHA ne s'affiche pas tant que le domaine n'est pas ajouté
+  (`CAPTCHA_ALLOWED_DOMAINS`, voir les refus dans les journaux). Les domaines
+  autorisés (Google notamment) restent des sites publics complets.
+- **DNS** : le DNS intégré de Docker reste joignable depuis le réseau
+  `internal` ; les versions de Docker antérieures à 26 y relayaient les
+  requêtes externes (fuite de données possible par requêtes DNS).
+  `inhibit_ipv4` est une option du pilote `bridge` présente de longue date ;
+  vérifiée en CI sur les runners amd64 et arm64, **pas sur le Pi**.
+- **Pixels uniquement** : x11vnc est en `-nosel` (pas de presse-papiers), mais
+  la personne qui pilote voit et peut taper tout ce que la page affiche, y
+  compris la session LinkedIn connectée.
 - Fermer ou recharger l'onglet perd la clé de tâche : la tâche continue jusqu'à
   son expiration mais n'est plus pilotable (annulation comprise).
 - Une seule personne peut regarder un écran à la fois (`-nevershared`).
+- La CI prouve l'isolement (`isolation_check`) mais **pas** le parcours réel :
+  affichage du CAPTCHA LinkedIn dans noVNC, complétude de la liste blanche,
+  acceptation des cookies rapatriés et redirection `/login` → checkpoint avec
+  un vrai compte demandent un essai manuel.

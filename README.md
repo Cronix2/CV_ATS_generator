@@ -70,8 +70,9 @@ Tout se règle dans **un seul fichier `.env`** à la racine (créé par `npm run
 | `BIND_ADDRESS` | `127.0.0.1` | Docker : interface sur laquelle les ports sont publiés. |
 | `ALLOW_LOCAL_LLM` | `0` | `1` autorise une URL de LLM locale ou privée saisie dans l'interface (Ollama…). |
 | `MAX_JOBS` | `2` | Tâches simultanées maximum (extractions + agent IA) ; au-delà, l'API répond 429. |
-| `INTERACTIVE_CAPTCHA` | `1` | Docker : un CAPTCHA LinkedIn se résout à la main depuis l'interface (écran virtuel noVNC, voir [docs/deployment-serveurcasa.md](docs/deployment-serveurcasa.md) §13). `0` désactive. |
-| `CAPTCHA_TIMEOUT` / `MAX_CAPTCHA_SESSIONS` | `300` / `1` | Délai de résolution (s) et nombre d'écrans virtuels simultanés. |
+| `INTERACTIVE_CAPTCHA` | `1` | Docker : un CAPTCHA LinkedIn se résout à la main depuis l'interface (navigateur isolé dans le service `captcha-browser`, affiché par noVNC, voir [docs/deployment-serveurcasa.md](docs/deployment-serveurcasa.md) §13). `0` désactive. |
+| `CAPTCHA_TIMEOUT` / `CAPTCHA_MEM_LIMIT` | `300` / `1536m` | Délai de résolution (s) et plafond mémoire du navigateur isolé (un CAPTCHA à la fois). |
+| `CAPTCHA_ALLOWED_DOMAINS` | *(vide)* | Domaines HTTPS ajoutés à la liste blanche du navigateur isolé (`docker compose logs captcha-egress` liste les refus). |
 | `API_DOCS` | `0` (`1` avec `npm start`) | Documentation interactive de l'API sur `/docs`. Désactivée en production et sous Docker. |
 | `AUDIT_LOG_FILE` | *(vide)* | Fichier où écrire aussi le journal d'audit (toujours écrit sur la sortie standard). |
 | `SITE_ADDRESS` / `HTTPS_BIND` | *(vide)* / `0.0.0.0` | Adresse servie en HTTPS et interface d'écoute du proxy Caddy (profil Docker `https`). |

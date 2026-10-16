@@ -1,0 +1,6 @@
+{
+  "URLBlocklist": ["file://*"],
+  "AllowFileSelectionDialogs": false,
+  "DownloadRestrictions": 3,
+  "PasswordManagerEnabled": false
+}

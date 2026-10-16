@@ -1,23 +1,31 @@
 """Remote CAPTCHA solving: a private virtual screen (Xvfb) shown through VNC (x11vnc) for one job.
 
 In Docker there is no screen: the scraper runs headless. When LinkedIn puts a CAPTCHA in front of the
-login, the scraper reopens its browser *headful* on a private Xvfb display; once the CAPTCHA is on
-screen, x11vnc exposes that same display on a Unix socket inside a private 0700 directory (never a
-TCP port). The API bridges an authenticated WebSocket to that socket (what websockify would do) and
+login, the API opens a session on the isolated `captcha-browser` service (browser_host.py): a fresh
+Chromium on a private Xvfb display, in its own container (no secrets, no LinkedIn sessions, no network
+but an HTTPS allowlist proxy). The scraper logs in there over CDP; once the CAPTCHA is on screen,
+x11vnc exposes that display on a Unix socket in a 0700 directory of a volume shared with the API (never
+a TCP port). The API bridges an authenticated WebSocket to that socket (what websockify would do) and
 the UI shows it with noVNC. A human solves the CAPTCHA; the scraper only resumes once LinkedIn itself
-has left its checkpoint page. Every process and file is removed when the display is closed.
+has left its checkpoint page, and only LinkedIn's cookies come back. Everything is removed afterwards.
 """
 
+import json
 import logging
 import os
+import re
 import select
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import tempfile
-import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 from app.security import PublicError
 
@@ -25,14 +33,17 @@ log = logging.getLogger(__name__)
 
 WIDTH, HEIGHT = 1280, 900  # small framebuffer (~4.5 MB): fine for a Raspberry Pi
 START_TIMEOUT = 10
-
-# One virtual screen + headful Chromium at a time by default: memory on the Raspberry Pi.
-_sessions = threading.BoundedSemaphore(max(1, int(os.getenv("MAX_CAPTCHA_SESSIONS", "1"))))
+# Volume shared by the API and captcha-browser: only the VNC Unix sockets of the running session.
+RUN_DIR = Path(os.getenv("CAPTCHA_RUN_DIR", "/run/pf-captcha"))
+SESSION_ID = re.compile(r"[A-Za-z0-9_-]{16,64}")
+UNAVAILABLE = "Navigateur de résolution des CAPTCHA indisponible (service captcha-browser) : réessayez plus tard."
+BUSY = "Une autre résolution de CAPTCHA est déjà en cours sur ce serveur : réessayez dans quelques minutes."
 
 
 def available() -> bool:
-    """Remote CAPTCHA solving needs Xvfb and x11vnc (installed in the Docker image). INTERACTIVE_CAPTCHA=0 disables it."""
-    return os.getenv("INTERACTIVE_CAPTCHA", "1") != "0" and all(shutil.which(b) for b in ("Xvfb", "x11vnc"))
+    """Remote CAPTCHA solving needs the isolated captcha-browser service (docker compose sets
+    CAPTCHA_BROWSER_URL). Never in the API process itself. INTERACTIVE_CAPTCHA=0 disables it."""
+    return os.getenv("INTERACTIVE_CAPTCHA", "1") != "0" and bool(os.getenv("CAPTCHA_BROWSER_URL"))
 
 
 def timeout() -> int:
@@ -54,22 +65,20 @@ def _stop(proc: subprocess.Popen | None) -> None:
 
 
 class VirtualDisplay:
-    """Context manager: a private X display for one browser, with an on-demand VNC server on a Unix socket."""
+    """Context manager: a private X display for one browser, with an on-demand VNC server on a Unix socket.
 
-    def __init__(self) -> None:
+    Runs in the captcha-browser container (and in browser_check), never next to the API's secrets."""
+
+    def __init__(self, base_dir: Path | None = None) -> None:
         self.display = ""
         self.dir: Path | None = None
+        self.base_dir = base_dir
         self._xvfb: subprocess.Popen | None = None
         self._vnc: subprocess.Popen | None = None
-        self._slot: threading.BoundedSemaphore | None = None
 
     def __enter__(self) -> "VirtualDisplay":
-        slots = _sessions
-        if not slots.acquire(blocking=False):
-            raise PublicError("Une autre résolution de CAPTCHA est déjà en cours sur ce serveur : réessayez dans quelques minutes.")
-        self._slot = slots
         try:
-            self.dir = Path(tempfile.mkdtemp(prefix="pf-captcha-"))  # mode 0700: only this user
+            self.dir = Path(tempfile.mkdtemp(prefix="pf-captcha-", dir=self.base_dir))  # mode 0700: only this user
             self._start_xvfb()
         except BaseException:
             self.close()
@@ -107,13 +116,6 @@ class VirtualDisplay:
         if not number.isdigit():
             raise RuntimeError(f"Xvfb did not start: {self._log_tail('xvfb')}")
         self.display = f":{number}"
-
-    def browser_options(self) -> dict:
-        """StealthySession options that put Chromium on this display, headful, filling the screen."""
-        return {
-            "additional_args": {"env": {**os.environ, "DISPLAY": self.display}},
-            "extra_flags": ["--window-position=0,0", f"--window-size={WIDTH},{HEIGHT}"],
-        }
 
     @property
     def vnc_socket(self) -> str | None:
@@ -163,6 +165,93 @@ class VirtualDisplay:
         if self.dir is not None:
             shutil.rmtree(self.dir, ignore_errors=True)
             self.dir = None
-        if self._slot is not None:
-            self._slot.release()
-            self._slot = None
+
+
+class RemoteBrowser:
+    """API side of one session on the isolated captcha-browser service (see browser_host.py).
+
+    Same interface as VirtualDisplay for the scraper and the WebSocket bridge (start_vnc, stop_vnc,
+    vnc_socket), plus `cdp_url` to drive the remote Chromium with StealthySession(cdp_url=...)."""
+
+    def __init__(self) -> None:
+        self.base = os.environ["CAPTCHA_BROWSER_URL"].rstrip("/")
+        self.id = ""
+        self.cdp_url = ""
+        self._socket: str | None = None
+
+    def _call(self, method: str, path: str = "") -> dict:
+        request = urllib.request.Request(f"{self.base}/session{path}", method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            if e.code == 409:
+                raise PublicError(BUSY) from None
+            log.error("captcha-browser %s %s: HTTP %s", method, path or "/session", e.code)
+        except (OSError, ValueError) as e:
+            log.error("captcha-browser %s %s: %r", method, path or "/session", e)
+        raise PublicError(UNAVAILABLE)
+
+    def __enter__(self) -> "RemoteBrowser":
+        data = self._call("POST")
+        session_id, port = str(data.get("id", "")), data.get("cdp_port")
+        if not SESSION_ID.fullmatch(session_id) or not isinstance(port, int):
+            raise PublicError(UNAVAILABLE)
+        self.id = session_id
+        try:
+            # Chromium's DevTools only accepts a Host header that is an IP (or localhost): no service name.
+            host = socket.gethostbyname(urlparse(self.base).hostname or "")
+        except OSError:
+            self.close()
+            raise PublicError(UNAVAILABLE) from None
+        self.cdp_url = f"http://{host}:{port}"
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    @staticmethod
+    def context_options() -> dict:
+        """Browser context for a human: page as large as the virtual screen, 1:1 pixels, TLS errors NOT ignored."""
+        return {"viewport": {"width": WIDTH, "height": HEIGHT - 100}, "screen": {"width": WIDTH, "height": HEIGHT},
+                "device_scale_factor": 1, "ignore_https_errors": False}
+
+    @property
+    def vnc_socket(self) -> str | None:
+        return self._socket
+
+    def start_vnc(self) -> None:
+        if self._socket:
+            return
+        path = Path(str(self._call("POST", f"/{self.id}/vnc").get("socket", "")))
+        self._socket = str(path) if _is_session_socket(path) else None
+        if not self._socket:
+            log.error("captcha-browser returned an unexpected VNC socket path")
+            raise PublicError(UNAVAILABLE)
+
+    def stop_vnc(self) -> None:
+        if self._socket is None:
+            return
+        self._socket = None
+        try:
+            self._call("DELETE", f"/{self.id}/vnc")
+        except PublicError:
+            pass  # logged; the session is closed right after anyway
+
+    def close(self) -> None:
+        self._socket = None
+        if self.id:
+            try:
+                self._call("DELETE", f"/{self.id}")
+            except PublicError:
+                pass  # logged; captcha-browser also reaps sessions that are too old
+            self.id = ""
+
+
+def _is_session_socket(path: Path) -> bool:
+    """Only a Unix socket inside the shared run directory: the API never connects anywhere else."""
+    try:
+        real = path.resolve(strict=True)
+        return real.is_relative_to(RUN_DIR.resolve()) and stat.S_ISSOCK(real.stat().st_mode)
+    except (OSError, ValueError):
+        return False

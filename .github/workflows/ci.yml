@@ -66,12 +66,16 @@ jobs:
           cache-from: type=gha,scope=api
           cache-to: type=gha,mode=max,scope=api
       # A /api/health check is not enough: really start Chromium the way the scraper does
-      # (headless, then headful on the private Xvfb display used for remote CAPTCHA solving,
-      # with x11vnc on a Unix socket and no TCP listener).
+      # (headless, then the isolated CAPTCHA browser's headful launch on a private Xvfb display,
+      # driven over CDP, with x11vnc on a Unix socket and no TCP listener).
       - name: Browser smoke test (amd64)
         run: >-
           docker run --rm --shm-size=1g --security-opt no-new-privileges:true
           passefiltre-api:ci python -m app.scraper.browser_check
+      # The real compose services: no secrets / sessions / host / LAN / internet for the CAPTCHA
+      # browser, HTTPS allowlist through captcha-egress, VNC through the shared socket only.
+      - name: CAPTCHA browser isolation (amd64)
+        run: bash .github/scripts/captcha-isolation.sh passefiltre-api:ci
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: frontend
@@ -102,3 +106,5 @@ jobs:
           test "$(uname -m)" = aarch64
           docker run --rm --shm-size=1g --security-opt no-new-privileges:true \
             passefiltre-api:ci-arm64 python -m app.scraper.browser_check
+      - name: CAPTCHA browser isolation (arm64)
+        run: bash .github/scripts/captcha-isolation.sh passefiltre-api:ci-arm64

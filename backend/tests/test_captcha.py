@@ -278,46 +278,98 @@ def test_headless_captcha_without_display_asks_for_a_visible_browser():
     assert job.status == "running"
 
 
-class FakeVirtualDisplay(FakeDisplay):
-    opened = closed = 0
-
-    def __enter__(self):
-        FakeVirtualDisplay.opened += 1
-        return self
-
-    def __exit__(self, *exc):
-        FakeVirtualDisplay.closed += 1
-
-
 @pytest.fixture
 def scrape_env(monkeypatch, tmp_path):
     monkeypatch.setattr(linkedin, "SESSIONS_DIR", tmp_path)
-    monkeypatch.setattr(captcha, "VirtualDisplay", FakeVirtualDisplay)
-    FakeVirtualDisplay.opened = FakeVirtualDisplay.closed = 0
     calls = []
 
-    def fake_scrape(base, email, password, hooks, user_data_dir, headless, debug, display=None):
-        calls.append((headless, display))
-        if display is None:
+    def fake_scrape(base, email, password, hooks, user_data_dir, headless, debug, cookies=None):
+        calls.append(("scrape", headless, cookies))
+        if not cookies:
             raise linkedin.CaptchaRequired("captcha")
         return Profile()
 
+    def fake_remote_login(email, password, hooks, debug):
+        calls.append(("remote", email))
+        return [{"name": "li_at", "value": "x", "domain": ".linkedin.com"}]
+
     monkeypatch.setattr(linkedin, "_scrape", fake_scrape)
+    monkeypatch.setattr(linkedin, "_remote_login", fake_remote_login)
     return calls
 
 
-def test_scrape_retries_on_a_virtual_display_after_a_headless_captcha(scrape_env):
+def test_headless_captcha_goes_through_the_isolated_browser(scrape_env):
     profile = linkedin.scrape_profile("https://www.linkedin.com/in/jane/", "j@x.fr", "p", jobs.Job(),
                                       remote_captcha=True)
     assert isinstance(profile, Profile)
-    assert [h for h, _ in scrape_env] == [True, False] and isinstance(scrape_env[1][1], FakeVirtualDisplay)
-    assert FakeVirtualDisplay.opened == FakeVirtualDisplay.closed == 1
+    # Never a visible browser in the API: remote login, then headless again with LinkedIn's cookies only.
+    assert scrape_env == [("scrape", True, None), ("remote", "j@x.fr"),
+                          ("scrape", True, [{"name": "li_at", "value": "x", "domain": ".linkedin.com"}])]
+
+
+def test_a_second_challenge_after_the_captcha_is_reported(scrape_env, monkeypatch):
+    def always_captcha(*args, **kwargs):
+        raise linkedin.CaptchaRequired("captcha")
+
+    monkeypatch.setattr(linkedin, "_scrape", always_captcha)
+    with pytest.raises(linkedin.ScrapeError, match="redemande une vérification"):
+        linkedin.scrape_profile("https://www.linkedin.com/in/jane/", "j@x.fr", "p", jobs.Job(), remote_captcha=True)
 
 
 def test_scrape_keeps_the_previous_behaviour_without_remote_captcha(scrape_env):
     with pytest.raises(linkedin.CaptchaRequired):
         linkedin.scrape_profile("https://www.linkedin.com/in/jane/", "j@x.fr", "p", jobs.Job())
-    assert len(scrape_env) == 1 and FakeVirtualDisplay.opened == 0
+    assert scrape_env == [("scrape", True, None)]
+
+
+def test_only_linkedin_cookies_leave_the_isolated_browser():
+    cookies = [
+        {"name": "li_at", "value": "s", "domain": ".www.linkedin.com", "path": "/", "expires": 1, "httpOnly": True,
+         "secure": True, "sameSite": "None", "partitionKey": "x"},
+        {"name": "JSESSIONID", "value": "j", "domain": "linkedin.com"},
+        {"name": "t", "value": "e", "domain": ".evil-linkedin.com"},
+        {"name": "t", "value": "e", "domain": "linkedin.com.evil.com"},
+        {"name": "_ga", "value": "g", "domain": ".google.com"},
+        {"name": "big", "value": "x" * 5000, "domain": ".linkedin.com"},
+    ]
+    kept = linkedin._linkedin_cookies(cookies)
+    assert [c["name"] for c in kept] == ["li_at", "JSESSIONID"]
+    assert set(kept[0]) == set(linkedin.COOKIE_FIELDS)  # only what add_cookies() accepts
+    with pytest.raises(linkedin.ScrapeError, match="session LinkedIn"):
+        linkedin._linkedin_cookies(cookies[1:])  # not logged in: nothing to resume with
+
+
+class LoginPage(CheckpointPage):
+    """/login redirected straight to a CAPTCHA checkpoint: no login form at all."""
+
+    def locator(self, selector: str) -> FakeLocator:
+        if selector in (linkedin.USER_INPUT, linkedin.PASSWORD_INPUT):
+            raise AssertionError("the login form must not be looked for on a checkpoint")
+        return super().locator(selector)
+
+    def screenshot(self, **kwargs) -> None:
+        pass
+
+
+class LoginSession:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    def fetch(self, url, page_action, **kwargs) -> None:
+        page_action(self.page)
+
+
+def test_login_redirected_to_a_captcha_asks_for_the_isolated_browser():
+    job = jobs.Job()
+    with pytest.raises(linkedin.CaptchaRequired):  # not "Formulaire de connexion introuvable"
+        linkedin._login(LoginSession(LoginPage(job, solve_after=None)), "j@x.fr", "p", job, True, False)
+
+
+def test_login_redirected_to_a_captcha_is_solved_in_the_same_browser():
+    job, display = jobs.Job(), FakeDisplay()
+    page = LoginPage(job, solve_after=2)
+    linkedin._login(LoginSession(page), "j@x.fr", "p", job, False, False, display)
+    assert page.url.endswith("/feed/") and (display.started, display.stopped) == (1, 1)
 
 
 def test_one_scrape_at_a_time_per_linkedin_account(monkeypatch, tmp_path):
@@ -345,14 +397,68 @@ def test_one_scrape_at_a_time_per_linkedin_account(monkeypatch, tmp_path):
     linkedin.scrape_profile(url, "j@x.fr", "p", jobs.Job())  # free again once the first one is over
 
 
-def test_virtual_displays_are_capped(monkeypatch):
-    monkeypatch.setattr(captcha, "_sessions", threading.BoundedSemaphore(1))
-    captcha._sessions.acquire()
-    with pytest.raises(PublicError, match="déjà en cours"):
-        captcha.VirtualDisplay().__enter__()
-
-
 def test_remote_captcha_can_be_disabled(monkeypatch, client):
+    monkeypatch.setenv("CAPTCHA_BROWSER_URL", "http://captcha-browser:9300")
     monkeypatch.setenv("INTERACTIVE_CAPTCHA", "0")
     assert captcha.available() is False
     assert client.get("/api/config").json()["remote_captcha"] is False
+
+
+def test_no_remote_captcha_without_the_isolated_service(monkeypatch):
+    """Never a human-driven browser inside the API container: without captcha-browser, the feature is off."""
+    monkeypatch.delenv("CAPTCHA_BROWSER_URL", raising=False)
+    monkeypatch.delenv("INTERACTIVE_CAPTCHA", raising=False)
+    assert captcha.available() is False
+    monkeypatch.setenv("CAPTCHA_BROWSER_URL", "http://captcha-browser:9300")
+    assert captcha.available() is True
+
+
+# --- Client du navigateur isolé (côté API) --------------------------------------------------------
+
+@pytest.fixture
+def remote(monkeypatch, tmp_path):
+    monkeypatch.setenv("CAPTCHA_BROWSER_URL", "http://127.0.0.1:9300")
+    monkeypatch.setattr(captcha, "RUN_DIR", tmp_path / "run")
+    (tmp_path / "run").mkdir()
+    answers = {"POST": {"id": "A" * 32, "cdp_port": 9222}}
+    calls = []
+
+    def fake_call(self, method, path=""):
+        calls.append((method, path))
+        return answers.get(method + path, answers.get(method, {}))
+
+    monkeypatch.setattr(captcha.RemoteBrowser, "_call", fake_call)
+    return answers, calls, tmp_path
+
+
+def test_remote_browser_session_lifecycle(remote):
+    answers, calls, _ = remote
+    with captcha.RemoteBrowser() as browser:
+        assert browser.cdp_url == "http://127.0.0.1:9222"  # an IP: DevTools refuses other Host headers
+    assert calls == [("POST", ""), ("DELETE", "/" + "A" * 32)]
+
+
+@pytest.mark.parametrize("bad", [{"id": "../../x", "cdp_port": 9222}, {"id": "A" * 32, "cdp_port": "9222"}, {}])
+def test_remote_browser_rejects_odd_session_answers(remote, bad):
+    answers, _, _ = remote
+    answers["POST"] = bad
+    with pytest.raises(PublicError, match="indisponible"):
+        captcha.RemoteBrowser().__enter__()
+
+
+def test_remote_browser_only_connects_to_sockets_of_the_shared_run_dir(remote):
+    answers, _, tmp_path = remote
+    outside = tmp_path / "elsewhere.sock"
+    outside.touch()
+    for path in [str(outside), str(tmp_path / "run" / ".." / "elsewhere.sock"), "/var/run/docker.sock", ""]:
+        answers["POST/" + "A" * 32 + "/vnc"] = {"socket": path}
+        with captcha.RemoteBrowser() as browser:
+            with pytest.raises(PublicError):
+                browser.start_vnc()
+            assert browser.vnc_socket is None
+
+
+def test_remote_browser_unreachable_is_reported(monkeypatch):
+    monkeypatch.setenv("CAPTCHA_BROWSER_URL", "http://127.0.0.1:1")  # nothing listens there
+    with pytest.raises(PublicError, match="indisponible"):
+        captcha.RemoteBrowser().__enter__()

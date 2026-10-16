@@ -30,7 +30,7 @@ class Job:
         self.prompt = ""
         self.result: Any = None
         self.error = ""
-        self.display: Any = None  # captcha.VirtualDisplay while a CAPTCHA is shown
+        self.display: Any = None  # captcha.RemoteBrowser while a CAPTCHA is shown
         self.captcha_deadline = 0.0
         self._code: str | None = None
         self._code_event = threading.Event()

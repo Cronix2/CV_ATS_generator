@@ -157,13 +157,17 @@ ON_LOGIN = re.compile(r"/(login|uas/|checkpoint|authwall|signup)")
 
 
 def _login(session: StealthySession, email: str, password: str, hooks: Hooks, headless: bool, debug: bool,
-           display: captcha.VirtualDisplay | None = None) -> None:
+           display: captcha.RemoteBrowser | None = None) -> None:
     errors: list[Exception] = []
 
     def action(page):
         try:
+            if _on_checkpoint(page.url):
+                # Account under scrutiny: LinkedIn sends /login straight to its checkpoint (CAPTCHA, code...),
+                # before any form. Same handling as after the form; headless + CAPTCHA -> CaptchaRequired.
+                _handle_checkpoint(page, hooks, headless, display)
             if not ON_LOGIN.search(page.url):
-                return  # persisted session: LinkedIn redirected us straight to the feed
+                return  # persisted session (or checkpoint passed): LinkedIn redirected us to the feed
             hooks.progress("Connexion à LinkedIn…")
             user = page.locator(USER_INPUT).filter(visible=True)
             pwd = page.locator(PASSWORD_INPUT).filter(visible=True)
@@ -217,11 +221,11 @@ def _on_checkpoint(url: str) -> bool:
     return "/checkpoint" in url or "/challenge" in url
 
 
-def _handle_checkpoint(page, hooks: Hooks, headless: bool, display: captcha.VirtualDisplay | None = None) -> None:
+def _handle_checkpoint(page, hooks: Hooks, headless: bool, display: captcha.RemoteBrowser | None = None) -> None:
     """Wait until LinkedIn itself lets us out of its checkpoint pages (code, CAPTCHA, app approval).
 
-    With a virtual display, a CAPTCHA is shown to the user over VNC; it is considered solved only when
-    LinkedIn leaves the checkpoint, never because the user says so."""
+    With the isolated remote browser, a CAPTCHA is shown to the user over VNC; it is considered solved
+    only when LinkedIn leaves the checkpoint, never because the user says so."""
     deadline = time.time() + 300
     notified = remote = False
     try:
@@ -455,8 +459,8 @@ def _empty_section(page: Selector) -> bool:
 
 def scrape_profile(url: str, email: str, password: str, hooks: Hooks,
                    headless: bool = True, debug: bool = False, remote_captcha: bool = False) -> Profile:
-    """remote_captcha: if a CAPTCHA blocks the headless login, retry once with a visible browser on a
-    private virtual display that the user reaches through the CAPTCHA viewer (see captcha.py)."""
+    """remote_captcha: if a CAPTCHA blocks the headless login, log in again in the isolated captcha-browser
+    (the user solves the CAPTCHA through the viewer), then resume headless with LinkedIn's cookies only."""
     base = normalize_profile_url(url)
     user_data_dir = _session_dir(email, password)
     with _account_in_use(user_data_dir):
@@ -466,13 +470,47 @@ def scrape_profile(url: str, email: str, password: str, hooks: Hooks,
             if not (headless and remote_captcha):
                 raise
         _check_cancelled(hooks)
-        hooks.progress("LinkedIn demande un CAPTCHA : ouverture d'un navigateur sur un écran virtuel…")
-        with captcha.VirtualDisplay() as display:
-            return _scrape(base, email, password, hooks, user_data_dir, False, debug, display)
+        hooks.progress("LinkedIn demande un CAPTCHA : ouverture d'un navigateur isolé…")
+        cookies = _remote_login(email, password, hooks, debug)
+        _check_cancelled(hooks)
+        try:
+            return _scrape(base, email, password, hooks, user_data_dir, True, debug, cookies)
+        except CaptchaRequired:
+            raise ScrapeError("LinkedIn redemande une vérification juste après le CAPTCHA : réessayez dans quelques minutes.") from None
+
+
+def _remote_login(email: str, password: str, hooks: Hooks, debug: bool) -> list[dict]:
+    """Log in on the isolated captcha-browser (fresh profile, no secrets, no other account, no LAN), keep
+    that same browser open while the user solves the CAPTCHA, then bring back LinkedIn's cookies only."""
+    with captcha.RemoteBrowser() as remote, StealthySession(
+        cdp_url=remote.cdp_url,
+        locale="en-US",
+        timeout=45_000,
+        retries=1,
+        google_search=False,
+        additional_args=remote.context_options(),
+    ) as session:
+        _login(session, email, password, hooks, False, debug, remote)
+        return _linkedin_cookies(session.context.cookies())
+
+
+COOKIE_FIELDS = ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
+
+
+def _linkedin_cookies(cookies: list[dict]) -> list[dict]:
+    """What the isolated browser may hand back to the API's profile: LinkedIn cookies, bounded, known fields."""
+    kept = []
+    for cookie in cookies:
+        domain = str(cookie.get("domain", "")).lstrip(".").lower()
+        if (domain == "linkedin.com" or domain.endswith(".linkedin.com")) and len(str(cookie.get("value", ""))) <= 4096:
+            kept.append({k: cookie[k] for k in COOKIE_FIELDS if k in cookie})
+    if not any(c.get("name") == "li_at" for c in kept):  # LinkedIn's session cookie
+        raise ScrapeError("La session LinkedIn n'a pas pu être récupérée après le CAPTCHA : réessayez.")
+    return kept[:200]
 
 
 def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: str, headless: bool, debug: bool,
-            display: captcha.VirtualDisplay | None = None) -> Profile:
+            cookies: list[dict] | None = None) -> Profile:
     with StealthySession(
         headless=headless,
         user_data_dir=user_data_dir,
@@ -480,9 +518,9 @@ def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: s
         timeout=45_000,
         retries=1,
         google_search=False,
-        **(display.browser_options() if display else {}),
+        cookies=cookies or [],
     ) as session:
-        _login(session, email, password, hooks, headless, debug, display)
+        _login(session, email, password, hooks, headless, debug)
         _check_cancelled(hooks)
         hooks.progress("Lecture du profil…", 10)
 

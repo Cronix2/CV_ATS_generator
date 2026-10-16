@@ -8,9 +8,11 @@ then starts that browser for real through StealthySession and loads a local page
     python -m app.scraper.browser_check           # full check: launch + navigation (CI, deploy)
     python -m app.scraper.browser_check --static  # only the expected executable (image build)
 
-When Xvfb and x11vnc are installed (Docker image), the full check also runs the remote CAPTCHA path:
-a headful Chromium on a private virtual display, then the VNC server on its Unix socket (RFB banner
-read, no TCP port opened), then checks that every process and temporary file is gone.
+When Xvfb and x11vnc are installed (Docker image), the full check also runs the remote CAPTCHA path of
+the captcha-browser service (browser_host.py): a headful Chromium with a fresh profile on a private
+virtual display, driven over CDP, then the VNC server on its Unix socket (RFB banner read, no TCP port
+opened), then checks that every process and temporary file is gone. Its network isolation needs the
+compose services: python -m app.scraper.isolation_check.
 
 Exit code 0 on success, 1 on failure. No network access is needed (the page is served on
 127.0.0.1) and nothing outside a temporary profile directory is written.
@@ -20,6 +22,7 @@ import argparse
 import http.server
 import os
 import platform
+import shutil
 import socket
 import sys
 import tempfile
@@ -104,34 +107,39 @@ def _tcp_listeners() -> set[str]:
     return found
 
 
-def display_check() -> None:
-    """Remote CAPTCHA path: headful Chromium on a private Xvfb display, shown by x11vnc on a Unix socket."""
+def display_check(executable: str) -> None:
+    """Remote CAPTCHA path, as in captcha-browser: headful Chromium on a private Xvfb display, driven over
+    CDP, shown by x11vnc on a Unix socket. No proxy here: the page is served on 127.0.0.1."""
     from scrapling.fetchers import StealthySession
 
-    from app.scraper.captcha import VirtualDisplay
+    from app.scraper.browser_host import Session
+    from app.scraper.captcha import RemoteBrowser
 
     server, url = _serve()
+    session = None
     try:
-        with VirtualDisplay() as display, tempfile.TemporaryDirectory(prefix="pf-browser-check-") as profile:
-            workdir = display.dir
-            with StealthySession(headless=False, user_data_dir=profile, timeout=60_000, retries=1,
-                                 google_search=False, **display.browser_options()) as session:
-                _check_page(session.fetch(url))
-                before = _tcp_listeners()
-                display.start_vnc()
-                opened = _tcp_listeners() - before
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as vnc:
-                    vnc.settimeout(10)
-                    vnc.connect(display.vnc_socket)
-                    banner = vnc.recv(12)
-                if not banner.startswith(b"RFB "):
-                    raise RuntimeError(f"no VNC banner on the Unix socket (got {banner!r})")
-                if opened:
-                    raise RuntimeError(f"the VNC server opened TCP ports: {sorted(map(_readable, opened))}")
+        session = Session(executable, proxy=None, run_dir=None)
+        workdir, profile = session.display.dir, session.profile
+        with StealthySession(cdp_url=f"http://127.0.0.1:{session.devtools_port}", timeout=60_000, retries=1,
+                             google_search=False, additional_args=RemoteBrowser.context_options()) as browser:
+            _check_page(browser.fetch(url))
+        before = _tcp_listeners()
+        session.display.start_vnc()
+        opened = _tcp_listeners() - before
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as vnc:
+            vnc.settimeout(10)
+            vnc.connect(session.display.vnc_socket)
+            banner = vnc.recv(12)
+        if not banner.startswith(b"RFB "):
+            raise RuntimeError(f"no VNC banner on the Unix socket (got {banner!r})")
+        if opened:
+            raise RuntimeError(f"the VNC server opened TCP ports: {sorted(map(_readable, opened))}")
     finally:
         server.shutdown()
-    if workdir is not None and workdir.exists():
-        raise RuntimeError("the virtual display directory was not removed")
+        if session is not None:
+            session.close()
+    if (workdir is not None and workdir.exists()) or (profile is not None and profile.exists()):
+        raise RuntimeError("the virtual display or the browser profile was not removed")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -160,17 +168,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: Chromium did not start or render through StealthySession: {e}", file=sys.stderr)
         return 1
     print("OK: Chromium started through StealthySession and rendered a page.")
-    from app.scraper import captcha
-
-    if not captcha.available():
-        print("SKIP: remote CAPTCHA disabled (Xvfb/x11vnc missing or INTERACTIVE_CAPTCHA=0).")
+    if not (shutil.which("Xvfb") and shutil.which("x11vnc")):
+        print("SKIP: remote CAPTCHA display (Xvfb/x11vnc missing).")
         return 0
     try:
-        display_check()
+        display_check(path)
     except Exception as e:
-        print(f"FAIL: remote CAPTCHA display (Xvfb + headful Chromium + x11vnc): {e}", file=sys.stderr)
+        print(f"FAIL: remote CAPTCHA browser (Xvfb + headful Chromium over CDP + x11vnc): {e}", file=sys.stderr)
         return 1
-    print("OK: headful Chromium on a private Xvfb display, VNC on a Unix socket only, cleaned up after use.")
+    print("OK: isolated CAPTCHA browser: fresh profile, private Xvfb display, CDP, VNC on a Unix socket only, "
+          "cleaned up after use.")
     return 0
 
 
