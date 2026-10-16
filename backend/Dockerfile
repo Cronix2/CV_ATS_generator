@@ -1,4 +1,4 @@
-# PasseFiltre API: FastAPI + Scrapling (headless Chromium) + LangChain.
+# PasseFiltre API: FastAPI + Scrapling (headless Chromium, headful on a virtual screen for CAPTCHAs) + LangChain.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -15,7 +15,13 @@ COPY requirements.lock .
 # Both are installed and each pins its own Chromium revision (e.g. patchright 1.63.0 -> 1243,
 # playwright 1.64.0 -> 1248): the browser MUST be installed by patchright's own CLI so its
 # revision always matches the locked patchright version. Playwright's browser is not needed.
-RUN pip install --require-hashes -r requirements.lock \
+# Remote CAPTCHA solving (app/scraper/captcha.py): Xvfb (private virtual screens for a headful Chromium)
+# and x11vnc (shows one of them on a Unix socket, bridged by the API). Debian packages, arm64 included.
+# /tmp/.X11-unix must exist beforehand: Xvfb runs as the unprivileged user and cannot create it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends xvfb x11vnc \
+ && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix \
+ && pip install --require-hashes -r requirements.lock \
  && python -m patchright install --with-deps chromium \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { apiBase, DEFAULT_API_URL } from "../lib/apiBase.ts";
+import { apiBase, DEFAULT_API_URL, wsUrl } from "../lib/apiBase.ts";
 
 test("empty or missing value falls back to the local dev API", () => {
   assert.equal(apiBase(undefined), DEFAULT_API_URL);
@@ -35,4 +35,10 @@ test("a trailing /api is removed so routes never become /api/api/", () => {
 test("a sub-path deployment is preserved", () => {
   assert.equal(apiBase("https://example.com/passefiltre/api"), "https://example.com/passefiltre");
   assert.equal(apiBase("https://example.com/apiary"), "https://example.com/apiary");
+});
+
+test("the CAPTCHA viewer WebSocket goes to the same host, encrypted behind HTTPS, through /api/", () => {
+  const path = "/api/jobs/abc/captcha/vnc";
+  assert.equal(wsUrl(apiBase("https://passefiltre.local.cronix.fr/api"), path), "wss://passefiltre.local.cronix.fr" + path);
+  assert.equal(wsUrl(apiBase(undefined), path), "ws://localhost:8000" + path);
 });

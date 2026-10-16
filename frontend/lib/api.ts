@@ -1,4 +1,4 @@
-import { apiBase } from "./apiBase";
+import { apiBase, wsUrl } from "./apiBase";
 import type { AgentName, AgentResult, ChatMessage, CV, Job, LLMConfig, Profile, ServerConfig, Suggestions } from "./types";
 
 const API = apiBase(process.env.NEXT_PUBLIC_API_URL); // origin only: routes below already start with /api/
@@ -10,17 +10,25 @@ export const setApiToken = (token: string) => {
 };
 const authHeaders = (): Record<string, string> => (apiToken ? { "X-PasseFiltre-Token": apiToken } : {});
 
+// Owner key of each job started from this tab (memory only): the server refuses job calls without it.
+const jobKeys = new Map<string, string>();
+function remember<J extends Job<unknown>>(job: J): J {
+  if (job.key) jobKeys.set(job.id, job.key);
+  return job;
+}
+const jobHeaders = (id: string): Record<string, string> => ({ "X-PasseFiltre-Job-Key": jobKeys.get(id) ?? "" });
+
 function httpError(status: number, detail: unknown): Error {
   if (status === 401) return new Error("Jeton d'accès manquant ou invalide : saisissez-le sur l'écran de connexion.");
   return new Error(typeof detail === "string" ? detail : `Erreur ${status}`);
 }
 
-async function call<T>(path: string, body?: unknown): Promise<T> {
+async function call<T>(path: string, body?: unknown, extra: { method?: string; headers?: Record<string, string> } = {}): Promise<T> {
   let res: Response;
   try {
     res = await fetch(API + path, {
-      method: body === undefined ? "GET" : "POST",
-      headers: { ...authHeaders(), ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+      method: extra.method ?? (body === undefined ? "GET" : "POST"),
+      headers: { ...authHeaders(), ...extra.headers, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch {
@@ -35,11 +43,16 @@ async function call<T>(path: string, body?: unknown): Promise<T> {
 
 export const api = {
   startScrape: (b: { profile_url: string; email: string; password: string; show_browser: boolean }) =>
-    call<Job>("/api/scrape", b),
-  job: <R = Profile>(id: string) => call<Job<R>>(`/api/jobs/${id}`),
-  sendCode: (id: string, code: string) => call(`/api/jobs/${id}/code`, { code }),
+    call<Job>("/api/scrape", b).then(remember),
+  job: <R = Profile>(id: string) => call<Job<R>>(`/api/jobs/${id}`, undefined, { headers: jobHeaders(id) }),
+  sendCode: (id: string, code: string) => call(`/api/jobs/${id}/code`, { code }, { headers: jobHeaders(id) }),
+  cancelJob: (id: string) => call(`/api/jobs/${id}`, undefined, { method: "DELETE", headers: jobHeaders(id) }),
+  /** Single-use ticket for the CAPTCHA viewer WebSocket (sent as a sub-protocol, never in the URL). */
+  captchaTicket: (id: string) =>
+    call<{ ticket: string; protocol: string; expires_in: number }>(`/api/jobs/${id}/captcha/ticket`, {}, { headers: jobHeaders(id) }),
+  captchaSocketUrl: (id: string) => wsUrl(API, `/api/jobs/${id}/captcha/vnc`),
   startAgent: (b: { llm: LLMConfig; cv: CV; instruction: string; history: ChatMessage[] }) =>
-    call<Job<AgentResult>>("/api/agent", b),
+    call<Job<AgentResult>>("/api/agent", b).then(remember),
   importOffer: (url: string) => call<{ text: string }>("/api/offer", { url }),
   forgetLinkedInSession: (b: { email: string; password: string }) =>
     call<{ removed: boolean }>("/api/linkedin/logout", b),

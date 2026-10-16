@@ -486,3 +486,115 @@ dépôt devenait privé, il faudrait un runner ARM64 payant, ou se contenter du
 test exécuté sur le Pi.
 - Aucune modification des services `restic-serveurcasa.*` ni des montages
   `/mnt/storageplex` et `/mnt/backup8to`.
+
+Depuis l'ajout du CAPTCHA à distance (§13), le même `browser_check` démarre
+aussi Chromium **en mode visible sur un écran Xvfb privé**, lance x11vnc sur un
+socket Unix, lit la bannière RFB, vérifie qu'**aucun port TCP** n'a été ouvert
+et que le répertoire temporaire a été supprimé.
+
+## 13. Résolution manuelle des CAPTCHA LinkedIn (noVNC)
+
+### Architecture
+
+Tout se passe **dans le conteneur `api`** : aucun nouveau service, aucun port
+publié en plus de `8100`.
+
+```text
+navigateur ──HTTPS/WSS──> NPM ──HTTP/WS──> api:8000  /api/jobs/{id}/captcha/vnc  (pont WebSocket FastAPI)
+                                               │ socket Unix 0700 (pas de TCP)
+                                               ▼
+                                     x11vnc ──> Xvfb :N (écran privé, -nolisten tcp)
+                                                  ▲
+                                     Chromium visible (même profil LinkedIn)
+```
+
+1. L'extraction démarre **sans interface** (headless, comportement inchangé).
+2. Si LinkedIn affiche un CAPTCHA, elle est relancée **une fois** en mode
+   visible sur un écran virtuel Xvfb privé (numéro choisi par Xvfb,
+   `-displayfd`), avec le même profil persistant.
+3. Quand le CAPTCHA apparaît, x11vnc démarre sur un **socket Unix** dans un
+   répertoire temporaire `0700` (`-rfbport 0`, aucun port TCP). La tâche passe
+   à l'état `needs_captcha` ; l'interface affiche « Résoudre le CAPTCHA ».
+4. Le bouton ouvre une fenêtre intégrée (noVNC) reliée au pont WebSocket de
+   l'API, qui joue le rôle de websockify.
+5. La reprise est décidée **uniquement côté serveur** : le scraping continue
+   lorsque LinkedIn quitte `/checkpoint` ou `/challenge`. Ouvrir ou fermer la
+   fenêtre ne valide rien. Aucune résolution automatique n'est tentée.
+6. À la fin (succès, expiration, annulation, erreur), x11vnc et Xvfb sont
+   arrêtés (groupe de processus entier) et le répertoire temporaire supprimé ;
+   les connexions noVNC ouvertes sont coupées.
+
+### Contrôle d'accès
+
+- Chaque tâche reçoit à sa création une **clé propre** (en-tête
+  `X-PasseFiltre-Job-Key`) gardée en mémoire par l'onglet qui l'a lancée.
+  Toutes les routes `/api/jobs/{id}…` l'exigent (`404` sinon) : une tâche
+  n'est jamais visible depuis une autre session, même avec le jeton.
+- `POST /api/jobs/{id}/captcha/ticket` (jeton `PASSEFILTRE_TOKEN` **et** clé de
+  tâche, uniquement en état `needs_captcha`) délivre un ticket **à usage
+  unique, valable 60 s, lié à cette tâche**.
+- Le ticket est transmis dans le sous-protocole WebSocket
+  (`Sec-WebSocket-Protocol`), jamais dans l'URL ; le jeton applicatif n'est
+  jamais transmis au WebSocket.
+- Le WebSocket exige en plus un `Origin` présent dans `CORS_ORIGINS` (protection
+  contre le détournement inter-sites) ; refus = fermeture `1008`, journalisé
+  (`captcha_vnc_refused`).
+- `ALLOWED_HOSTS` s'applique aussi au WebSocket.
+
+### Variables d'environnement (`/opt/passefiltre/.env`, toutes facultatives)
+
+| Variable | Défaut | Rôle |
+| --- | --- | --- |
+| `INTERACTIVE_CAPTCHA` | `1` | `0` = désactive (retour au message « relancez en mode visible ») |
+| `CAPTCHA_TIMEOUT` | `300` | secondes laissées pour résoudre (minimum 60) |
+| `MAX_CAPTCHA_SESSIONS` | `1` | écrans virtuels simultanés (au-delà : message d'attente) |
+| `API_MEM_LIMIT` | `3g` | plafond mémoire du conteneur `api` |
+
+`CORS_ORIGINS` doit contenir `https://passefiltre.local.cronix.fr` (déjà requis
+par §2bis).
+
+### Nginx Proxy Manager
+
+Sur l'hôte `passefiltre.local.cronix.fr` :
+
+- Onglet **Details** : cocher **Websockets Support**.
+- Si `/api/` est une *Custom location*, NPM n'y reporte pas toujours cette
+  option : dans son ⚙ (configuration avancée de la location), ajouter
+
+  ```nginx
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_read_timeout 600s;
+  ```
+
+- Ne rien changer d'autre : `/` et `/api/` gardent leurs cibles. **Ne créer
+  aucun hôte ni port** pour VNC/noVNC : ils n'existent pas hors du conteneur.
+
+Vérification : pendant un CAPTCHA, outils de développement → Réseau → WS :
+`wss://passefiltre.local.cronix.fr/api/jobs/…/captcha/vnc`, statut `101`.
+
+### Ressources du Raspberry Pi 5
+
+- Une seule session d'écran virtuel par défaut ; un seul scraping par compte
+  LinkedIn ; au plus 2 tâches en parallèle (inchangé).
+- `docker-compose.yml` : `init: true` (récupère les processus orphelins de
+  Chromium), `pids_limit: 512`, `mem_limit: ${API_MEM_LIMIT:-3g}`. Si le cgroup
+  mémoire est désactivé sur le Pi, Docker l'ignore avec un avertissement
+  (activable via `cgroup_enable=memory` dans `/boot/firmware/cmdline.txt`,
+  non fait par ce dépôt).
+- L'image grossit de quelques dizaines de Mo (`xvfb`, `x11vnc`).
+
+### Déploiement
+
+Aucune étape manuelle côté Docker : le workflow habituel (§3 à §5) suffit. À
+faire **une fois** avant de l'utiliser : l'option WebSockets dans NPM
+(ci-dessus). Rollback : §7 (l'ancienne image ignore simplement ces variables).
+
+### Limites
+
+- La reprise relance l'extraction en mode visible depuis le début (la session
+  headless n'est pas transférable) ; le profil persistant conserve les cookies.
+- Fermer ou recharger l'onglet perd la clé de tâche : la tâche continue jusqu'à
+  son expiration mais n'est plus pilotable (annulation comprise).
+- Une seule personne peut regarder un écran à la fois (`-nevershared`).

@@ -65,7 +65,9 @@ jobs:
           tags: passefiltre-api:ci
           cache-from: type=gha,scope=api
           cache-to: type=gha,mode=max,scope=api
-      # A /api/health check is not enough: really start Chromium the way the scraper does.
+      # A /api/health check is not enough: really start Chromium the way the scraper does
+      # (headless, then headful on the private Xvfb display used for remote CAPTCHA solving,
+      # with x11vnc on a Unix socket and no TCP listener).
       - name: Browser smoke test (amd64)
         run: >-
           docker run --rm --shm-size=1g --security-opt no-new-privileges:true

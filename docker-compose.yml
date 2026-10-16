@@ -23,6 +23,11 @@ services:
     volumes:
       - sessions:/app/.sessions   # LinkedIn session cookies, kept between restarts
     shm_size: 1gb                 # Chromium needs more than Docker's default 64 MB
+    # Chromium, Xvfb and x11vnc (remote CAPTCHA) are child processes: a real init reaps them, and the
+    # limits keep a runaway browser from starving the other services of the Raspberry Pi.
+    init: true
+    pids_limit: 512
+    mem_limit: ${API_MEM_LIMIT:-3g}
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped

@@ -12,16 +12,18 @@ import logging
 import re
 import secrets
 import shutil
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Any, Callable, Iterator, Protocol
 
 from scrapling.fetchers import StealthySession
 from scrapling.parser import Selector
 
 from app.models import Basics, Profile
 from app.security import PublicError
-from app.scraper import parsers
+from app.scraper import captcha, parsers
 from app.scraper.parsers import Entry
 
 log = logging.getLogger(__name__)
@@ -60,9 +62,21 @@ class ScrapeError(PublicError):
     pass
 
 
+class CaptchaRequired(ScrapeError):
+    """A CAPTCHA showed up in a headless browser: only a human can solve it, on a visible browser."""
+
+
 class Hooks(Protocol):
     def progress(self, message: str, percent: int | None = None) -> None: ...
     def ask_code(self, message: str) -> str | None: ...
+    def cancelled(self) -> bool: ...
+    def captcha_open(self, display: Any, deadline: float) -> None: ...
+    def captcha_closed(self) -> None: ...
+
+
+def _check_cancelled(hooks: Hooks) -> None:
+    if hooks.cancelled():
+        raise ScrapeError("Extraction annulée.")
 
 
 def normalize_profile_url(url: str) -> str:
@@ -95,6 +109,24 @@ def _session_dir(email: str, password: str) -> str:
     return str(path)
 
 
+_accounts_in_use: set[str] = set()
+_accounts_lock = threading.Lock()
+
+
+@contextmanager
+def _account_in_use(user_data_dir: str) -> Iterator[None]:
+    """One browser at a time per LinkedIn profile directory (Chromium cannot share it)."""
+    with _accounts_lock:
+        if user_data_dir in _accounts_in_use:
+            raise ScrapeError("Une extraction est déjà en cours avec ce compte LinkedIn : attendez qu'elle se termine.")
+        _accounts_in_use.add(user_data_dir)
+    try:
+        yield
+    finally:
+        with _accounts_lock:
+            _accounts_in_use.discard(user_data_dir)
+
+
 def forget_session(email: str, password: str) -> bool:
     """Delete the saved LinkedIn session of this account (needs its credentials: nobody can wipe someone else's)."""
     path = _session_path(email, password)
@@ -124,7 +156,8 @@ PASSWORD_INPUT = "input#password, input[name=session_password], input[type=passw
 ON_LOGIN = re.compile(r"/(login|uas/|checkpoint|authwall|signup)")
 
 
-def _login(session: StealthySession, email: str, password: str, hooks: Hooks, headless: bool, debug: bool) -> None:
+def _login(session: StealthySession, email: str, password: str, hooks: Hooks, headless: bool, debug: bool,
+           display: captcha.VirtualDisplay | None = None) -> None:
     errors: list[Exception] = []
 
     def action(page):
@@ -156,7 +189,7 @@ def _login(session: StealthySession, email: str, password: str, hooks: Hooks, he
                 pass
             page.wait_for_load_state("domcontentloaded")
             page.wait_for_timeout(2000)
-            _handle_checkpoint(page, hooks, headless)
+            _handle_checkpoint(page, hooks, headless, display)
             if ON_LOGIN.search(page.url):
                 raise ScrapeError("Connexion refusée : identifiant ou mot de passe LinkedIn invalide.")
         except Exception as e:  # Scrapling swallows page_action errors, keep them
@@ -176,34 +209,66 @@ def _login(session: StealthySession, email: str, password: str, hooks: Hooks, he
         raise ScrapeError("Échec de la connexion à LinkedIn. Réessayez, ou cochez « Afficher le navigateur » pour voir ce qui bloque.")
 
 
-def _handle_checkpoint(page, hooks: Hooks, headless: bool) -> None:
+CAPTCHA = "iframe[src*=captcha], #captcha-internal, iframe[title*=captcha i]"
+PIN_INPUT = "input[name=pin], input[id*=verification_pin], input[name*=verificationCode]"
+
+
+def _on_checkpoint(url: str) -> bool:
+    return "/checkpoint" in url or "/challenge" in url
+
+
+def _handle_checkpoint(page, hooks: Hooks, headless: bool, display: captcha.VirtualDisplay | None = None) -> None:
+    """Wait until LinkedIn itself lets us out of its checkpoint pages (code, CAPTCHA, app approval).
+
+    With a virtual display, a CAPTCHA is shown to the user over VNC; it is considered solved only when
+    LinkedIn leaves the checkpoint, never because the user says so."""
     deadline = time.time() + 300
-    notified = False
-    while "/checkpoint" in page.url or "/challenge" in page.url:
-        if time.time() > deadline:
-            raise ScrapeError("Vérification LinkedIn non terminée après 5 minutes.")
-        pin = page.locator("input[name=pin], input[id*=verification_pin], input[name*=verificationCode]")
-        if pin.count() and pin.first.is_visible():
-            code = hooks.ask_code("LinkedIn demande un code de vérification (envoyé par email ou SMS).")
-            if not code:
-                raise ScrapeError("Vérification annulée.")
-            pin.first.fill(code.strip())
-            page.locator("button[type=submit], #email-pin-submit-button, #pin-submit-button").first.click()
-            page.wait_for_load_state("domcontentloaded")
-            page.wait_for_timeout(3000)
-            continue
-        if page.locator("iframe[src*=captcha], #captcha-internal, iframe[title*=captcha i]").count():
-            if headless:
-                raise ScrapeError(
-                    "LinkedIn affiche un captcha. Relancez avec l'option « Afficher le navigateur » pour le résoudre."
-                )
-            if not notified:
-                hooks.progress("Résolvez le captcha dans la fenêtre du navigateur…")
+    notified = remote = False
+    try:
+        while _on_checkpoint(page.url):
+            _check_cancelled(hooks)
+            if time.time() > deadline:
+                raise ScrapeError("CAPTCHA non résolu dans le temps imparti : relancez l'extraction." if remote
+                                  else "Vérification LinkedIn non terminée après 5 minutes.")
+            pin = page.locator(PIN_INPUT)
+            if pin.count() and pin.first.is_visible():
+                if remote:  # the CAPTCHA is done: the code goes through the PasseFiltre form
+                    display.stop_vnc()
+                    hooks.captcha_closed()
+                    remote = False
+                code = hooks.ask_code("LinkedIn demande un code de vérification (envoyé par email ou SMS).")
+                if not code:
+                    raise ScrapeError("Vérification annulée.")
+                pin.first.fill(code.strip())
+                page.locator("button[type=submit], #email-pin-submit-button, #pin-submit-button").first.click()
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(3000)
+                continue
+            if page.locator(CAPTCHA).count():
+                if display is not None:
+                    if not remote:
+                        display.start_vnc()
+                        deadline = time.time() + captcha.timeout()
+                        hooks.captcha_open(display, deadline)
+                        hooks.progress("LinkedIn demande un CAPTCHA : cliquez sur « Résoudre le CAPTCHA » pour le faire vous-même.")
+                        remote = True
+                elif headless:
+                    raise CaptchaRequired(
+                        "LinkedIn affiche un captcha. Relancez avec l'option « Afficher le navigateur » pour le résoudre."
+                    )
+                elif not notified:
+                    hooks.progress("Résolvez le captcha dans la fenêtre du navigateur…")
+                    notified = True
+            elif not notified and not remote:
+                hooks.progress("LinkedIn demande une validation : approuvez la connexion dans l'application mobile…")
                 notified = True
-        elif not notified:
-            hooks.progress("LinkedIn demande une validation : approuvez la connexion dans l'application mobile…")
-            notified = True
-        page.wait_for_timeout(3000)
+            page.wait_for_timeout(2000)
+        if remote:
+            hooks.progress("Vérification acceptée par LinkedIn : reprise de l'extraction…")
+    finally:
+        if remote:  # solved, expired, cancelled or browser gone: the VNC session ends here
+            display.stop_vnc()
+            hooks.captcha_closed()
 
 
 # --------------------------------------------------------------------------- pages
@@ -389,17 +454,36 @@ def _empty_section(page: Selector) -> bool:
 # --------------------------------------------------------------------------- entry point
 
 def scrape_profile(url: str, email: str, password: str, hooks: Hooks,
-                   headless: bool = True, debug: bool = False) -> Profile:
+                   headless: bool = True, debug: bool = False, remote_captcha: bool = False) -> Profile:
+    """remote_captcha: if a CAPTCHA blocks the headless login, retry once with a visible browser on a
+    private virtual display that the user reaches through the CAPTCHA viewer (see captcha.py)."""
     base = normalize_profile_url(url)
+    user_data_dir = _session_dir(email, password)
+    with _account_in_use(user_data_dir):
+        try:
+            return _scrape(base, email, password, hooks, user_data_dir, headless, debug)
+        except CaptchaRequired:
+            if not (headless and remote_captcha):
+                raise
+        _check_cancelled(hooks)
+        hooks.progress("LinkedIn demande un CAPTCHA : ouverture d'un navigateur sur un écran virtuel…")
+        with captcha.VirtualDisplay() as display:
+            return _scrape(base, email, password, hooks, user_data_dir, False, debug, display)
+
+
+def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: str, headless: bool, debug: bool,
+            display: captcha.VirtualDisplay | None = None) -> Profile:
     with StealthySession(
         headless=headless,
-        user_data_dir=_session_dir(email, password),
+        user_data_dir=user_data_dir,
         locale="en-US",  # stable UI labels/date formats for the parsers
         timeout=45_000,
         retries=1,
         google_search=False,
+        **(display.browser_options() if display else {}),
     ) as session:
-        _login(session, email, password, hooks, headless, debug)
+        _login(session, email, password, hooks, headless, debug, display)
+        _check_cancelled(hooks)
         hooks.progress("Lecture du profil…", 10)
 
         top: dict = {}
@@ -424,6 +508,7 @@ def scrape_profile(url: str, email: str, password: str, hooks: Hooks,
             _dump("contact", contact)
 
         for i, (attr, slug) in enumerate(SECTIONS.items()):
+            _check_cancelled(hooks)
             hooks.progress(f"Section « {attr} »…", 20 + int(75 * i / len(SECTIONS)))
             page = session.fetch(f"{base}details/{slug}/", page_action=_scroll_and_expand, wait=500)
             if debug:
