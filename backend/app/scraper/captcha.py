@@ -131,10 +131,11 @@ class VirtualDisplay:
         sock.unlink(missing_ok=True)
         self._vnc = self._spawn("x11vnc", [
             "x11vnc", "-display", self.display, "-unixsock", str(sock),
-            # No TCP at all: -rfbport 0 only stops the IPv4 listener; Debian builds x11vnc with its own IPv6
-            # listener on by default (port 5900, on ::1 because of -localhost), which only -no6 turns off.
-            # -localhost / -noipv6 stay as a safety net. browser_check fails if any TCP port appears.
-            "-rfbport", "0", "-no6", "-noipv6", "-localhost",
+            # No TCP at all. -rfbport 0 only stops the IPv4 listener; LibVNCServer also opens an IPv6 one
+            # (ipv6port, default 5900, on ::1 because of -localhost) unless -rfbportv6 0, and x11vnc has its
+            # own IPv6 listener, on by default in Debian, that only -no6 turns off. -localhost / -noipv6 stay
+            # as a safety net. browser_check fails if any TCP port appears.
+            "-rfbport", "0", "-rfbportv6", "0", "-no6", "-noipv6", "-localhost",
             "-nopw",          # access control is done by the API (ticket + Origin) before the socket is reached
             "-forever",       # the user may close the viewer and reopen it
             "-nevershared",   # a new viewer replaces the previous one

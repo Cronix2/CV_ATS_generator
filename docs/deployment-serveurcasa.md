@@ -513,7 +513,8 @@ navigateur ──HTTPS/WSS──> NPM ──HTTP/WS──> api:8000  /api/jobs/{
    visible sur un écran virtuel Xvfb privé (numéro choisi par Xvfb,
    `-displayfd`), avec le même profil persistant.
 3. Quand le CAPTCHA apparaît, x11vnc démarre sur un **socket Unix** dans un
-   répertoire temporaire `0700` (`-rfbport 0`, aucun port TCP). La tâche passe
+   répertoire temporaire `0700` (`-rfbport 0 -rfbportv6 0 -no6` : aucun port TCP, pas même
+   en loopback IPv4/IPv6 ; le test navigateur échoue sinon). La tâche passe
    à l'état `needs_captcha` ; l'interface affiche « Résoudre le CAPTCHA ».
 4. Le bouton ouvre une fenêtre intégrée (noVNC) reliée au pont WebSocket de
    l'API, qui joue le rôle de websockify.
