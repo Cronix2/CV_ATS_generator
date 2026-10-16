@@ -12,8 +12,8 @@ push sur main
 ┌──────────────┐   succès    ┌──────────────────────────────────────────────┐
 │   CI (ci.yml)│────────────▶│  Deploy to ServeurCasa (deploy-serveurcasa.yml)│
 │  tests + build│            │                                                │
-└──────────────┘             │  job build  (GitHub-hosted, ubuntu-latest)     │
-                             │    buildx + QEMU → images linux/arm64          │
+└──────────────┘             │  job build  (GitHub-hosted, ubuntu-24.04-arm)  │
+                             │    buildx natif (sans QEMU) → linux/arm64      │
                              │    push GHCR : passefiltre-api / -web          │
                              │    tag immuable  sha-<commit>  (+ main)        │
                              │                                                │
@@ -186,8 +186,11 @@ la CI déclenche automatiquement :
    <https://passefiltre.local.cronix.fr/api/health> (API). Les healthchecks
    du workflow, eux, interrogent directement `192.168.1.63:8100` / `:3101`.
 
-Le premier build `arm64` sous QEMU est lent (installation de Chromium /
-Playwright émulée). Les builds suivants réutilisent le cache GitHub Actions.
+Les images `arm64` sont construites nativement sur un runner GitHub
+`ubuntu-24.04-arm`, sans émulation QEMU (sous QEMU, Node plantait pendant
+`npm ci` : `Illegal instruction`). Le job vérifie ensuite sur GHCR que les tags
+`sha-<commit>` et `main` pointent vers le digest poussé, une image
+`linux/arm64` unique. Les builds suivants réutilisent le cache GitHub Actions.
 
 ## 5. Mise à jour automatique
 
@@ -354,8 +357,9 @@ Si les images sont **privées** et que le pull échoue sur le runner
 
 ### ARM64
 
-- Si le build échoue côté GitHub, vérifier que `docker/setup-qemu-action` s'est
-  bien exécuté (émulation `arm64`).
+- Le build tourne sur un runner GitHub `ubuntu-24.04-arm` (ARM64 natif, sans
+  QEMU) ; le job s'arrête si `uname -m` n'est pas `aarch64`. La CI construit
+  aussi l'image web arm64 sur chaque PR (job `web-arm64`).
 - Sur le Pi, `docker image inspect ghcr.io/cronix2/passefiltre-api:sha-<commit>
   --format '{{.Architecture}}'` doit renvoyer `arm64`.
 
