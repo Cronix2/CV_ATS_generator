@@ -132,6 +132,7 @@ export function ConnectStep() {
           Le compte sert à ouvrir une session LinkedIn sur votre machine pour lire le profil, à un rythme raisonnable.
           Le mot de passe n&apos;est ni enregistré ni journalisé ; seuls les cookies de session sont gardés localement
           (dossier <code>backend/.sessions</code>) pour éviter de se reconnecter à chaque fois.
+          {server?.remote_captcha && " Si LinkedIn affiche un CAPTCHA, vous le résoudrez vous-même depuis cette page."}
         </p>
         {error && <Alert>{error}</Alert>}
         <div className="flex flex-wrap items-center gap-3 pt-1">

@@ -8,12 +8,13 @@ import secrets
 from urllib.parse import urlparse
 
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
+from starlette.requests import HTTPConnection, Request
 from starlette.responses import JSONResponse, Response
 
 # Reachable without the token: the UI needs them to know whether a token is required.
 PUBLIC_PATHS = {"/api/health", "/api/config"}
 TOKEN_HEADER = "X-PasseFiltre-Token"
+JOB_KEY_HEADER = "X-PasseFiltre-Job-Key"  # per-job owner secret (see jobs.Job.key)
 MIN_NETWORK_TOKEN_LENGTH = 32
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -79,7 +80,7 @@ def assert_safe_config() -> None:
 
 # --------------------------------------------------------------------------- request helpers
 
-def client_ip(request: Request) -> str:
+def client_ip(request: HTTPConnection) -> str:
     # Behind the HTTPS proxy, uvicorn --proxy-headers already puts the real client in request.client.
     return request.client.host if request.client else "?"
 
@@ -93,7 +94,7 @@ def pseudonym(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode()).hexdigest()[:12]
 
 
-def audit(request: Request, action: str, **details: object) -> None:
+def audit(request: HTTPConnection, action: str, **details: object) -> None:
     """One line per sensitive action. Never pass passwords, API keys or CV content here."""
     fields = " ".join(f"{k}={v}" for k, v in details.items())
     audit_log.info("action=%s ip=%s %s", action, client_ip(request), fields)

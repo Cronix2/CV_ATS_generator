@@ -2,6 +2,7 @@ import type { NextConfig } from "next";
 
 const dev = process.env.NODE_ENV !== "production";
 const apiOrigin = new URL(process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").origin;
+const apiSocketOrigin = apiOrigin.replace(/^http/, "ws"); // CAPTCHA viewer (noVNC) WebSocket, wss:// behind HTTPS
 
 // Strict-enough CSP for an app that handles LinkedIn credentials and an LLM key.
 // Next.js needs inline scripts/styles (no nonce setup here); dev mode also needs eval + the HMR websocket.
@@ -11,7 +12,7 @@ const csp = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self'",
-  `connect-src 'self' ${apiOrigin}${dev ? " ws: wss:" : ""}`,
+  `connect-src 'self' ${apiOrigin} ${apiSocketOrigin}${dev ? " ws: wss:" : ""}`,
   "frame-src 'self' blob:", // live PDF preview
   "object-src 'none'",
   "base-uri 'self'",

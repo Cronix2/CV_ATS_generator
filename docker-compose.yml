@@ -17,14 +17,72 @@ services:
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:-${SITE_ADDRESS:-}}
       # The API is only reachable through published ports / the proxy: trust X-Forwarded-For from the proxy.
       FORWARDED_ALLOW_IPS: "*"
+      # Remote CAPTCHA solving happens in the isolated captcha-browser service, never in this container.
+      CAPTCHA_BROWSER_URL: http://captcha-browser:9300
     ports:
       # Published on this machine only. To reach PasseFiltre from another computer, prefer the `https` profile.
       - "${BIND_ADDRESS:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
     volumes:
       - sessions:/app/.sessions   # LinkedIn session cookies, kept between restarts
+      - captcha-run:/run/pf-captcha  # VNC Unix socket of the isolated CAPTCHA browser (nothing else)
+    networks: [default, captcha]
     shm_size: 1gb                 # Chromium needs more than Docker's default 64 MB
+    # Chromium is a child process: a real init reaps it, and the limits keep a runaway browser from
+    # starving the other services of the Raspberry Pi.
+    init: true
+    pids_limit: 512
+    mem_limit: ${API_MEM_LIMIT:-3g}
     security_opt:
       - no-new-privileges:true
+    restart: unless-stopped
+
+  # Remote CAPTCHA solving (docs/deployment-serveurcasa.md §13): the only browser a human drives, through
+  # noVNC. Own container, fresh profile per session, no secrets (no env_file), no LinkedIn sessions, no
+  # capabilities, and only the internal `captcha` network: the web is reached through captcha-egress.
+  captcha-browser:
+    build: ./backend
+    image: ghcr.io/cronix2/passefiltre-api:latest
+    command: ["python", "-m", "app.scraper.browser_host"]
+    environment:
+      CAPTCHA_PROXY: http://captcha-egress:3128
+      CAPTCHA_TIMEOUT: ${CAPTCHA_TIMEOUT:-300}
+    volumes:
+      - captcha-run:/run/pf-captcha
+    networks: [captcha]
+    shm_size: 256m
+    init: true
+    pids_limit: 256
+    mem_limit: ${CAPTCHA_MEM_LIMIT:-1536m}
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9300/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+    restart: unless-stopped
+
+  # The CAPTCHA browser's only way out: HTTPS tunnels to an allowlist of public hosts (app/scraper/egress.py).
+  captcha-egress:
+    build: ./backend
+    image: ghcr.io/cronix2/passefiltre-api:latest
+    command: ["python", "-m", "app.scraper.egress"]
+    environment:
+      CAPTCHA_ALLOWED_DOMAINS: ${CAPTCHA_ALLOWED_DOMAINS:-}
+    networks: [default, captcha]
+    read_only: true
+    init: true
+    pids_limit: 64
+    mem_limit: 128m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 3128), 3).close()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
     restart: unless-stopped
 
   web:
@@ -61,5 +119,16 @@ services:
 
 volumes:
   sessions:
+  captcha-run:
   caddy_data:
   caddy_config:
+
+networks:
+  default:
+  # API <-> captcha-browser <-> captcha-egress. `internal`: no route out. inhibit_ipv4: the bridge gets no
+  # gateway address on the host either, so the CAPTCHA browser cannot reach the host's services (NAS
+  # admin pages, other stacks' published ports). Scoped to this Compose project: other apps untouched.
+  captcha:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.inhibit_ipv4: "true"

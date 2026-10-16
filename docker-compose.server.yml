@@ -7,7 +7,7 @@
 # Everything else (ports, volumes, security_opt, restart, env_file, shm_size…) is
 # inherited from docker-compose.yml and driven by /opt/passefiltre/.env, so this
 # overlay only does three things:
-#   1. Pin both services to a prebuilt GHCR image for the exact commit (tag = sha-<commit>).
+#   1. Pin every service to a prebuilt GHCR image for the exact commit (tag = sha-<commit>).
 #      A Docker tag is a mutable pointer, not a cryptographic digest: `sha-<commit>` is
 #      traceable to the commit that produced it, but it is NOT guaranteed immutable.
 #      See docs/deployment-serveurcasa.md (« Tag SHA vs digest ») for the details and
@@ -31,6 +31,17 @@ services:
     build: !reset null
     image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:?PASSEFILTRE_IMAGE_TAG is required (see /opt/passefiltre/deploy.env)}
     pull_policy: missing   # commit-pinned tag: pull once, reuse across reboots
+
+  # Isolated CAPTCHA browser and its egress proxy: same API image, same pinned tag.
+  captcha-browser:
+    build: !reset null
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:?PASSEFILTRE_IMAGE_TAG is required (see /opt/passefiltre/deploy.env)}
+    pull_policy: missing
+
+  captcha-egress:
+    build: !reset null
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:?PASSEFILTRE_IMAGE_TAG is required (see /opt/passefiltre/deploy.env)}
+    pull_policy: missing
 
   web:
     build: !reset null

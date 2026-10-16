@@ -4,6 +4,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api } from "@/lib/api";
 import { normalizeCV, useStore } from "@/lib/store";
 import type { Job } from "@/lib/types";
+import { CaptchaViewer } from "./CaptchaViewer";
 import { Alert, Button, Field, Input, Spinner } from "./ui";
 
 export function ScrapeStep() {
@@ -12,6 +13,8 @@ export function ScrapeStep() {
   const [error, setError] = useState("");
   const [code, setCode] = useState("");
   const [sending, setSending] = useState(false);
+  const [viewer, setViewer] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
     if (!jobId) return;
@@ -53,8 +56,20 @@ export function ScrapeStep() {
     }
   }
 
+  async function cancel() {
+    setCancelling(true);
+    try {
+      await api.cancelJob(jobId); // the next poll shows the job stopped
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   const failed = job?.status === "error" || Boolean(error);
   const last = job?.messages.at(-1) ?? "Démarrage du navigateur…";
+  const captcha = job?.status === "needs_captcha";
 
   return (
     <div className="space-y-6">
@@ -84,12 +99,34 @@ export function ScrapeStep() {
           </form>
         )}
 
+        {captcha && (
+          <div className="mt-6 space-y-3 rounded-md border border-mark bg-mark/15 p-4">
+            <p className="text-sm font-medium">{job.prompt}</p>
+            <p className="text-sm text-muted">
+              Le navigateur du serveur s&apos;ouvre dans une fenêtre de cette page. L&apos;extraction reprend dès que
+              LinkedIn accepte la vérification.
+            </p>
+            <Button onClick={() => setViewer(true)}>Résoudre le CAPTCHA</Button>
+          </div>
+        )}
+        {captcha && viewer && (
+          <CaptchaViewer jobId={jobId} expiresIn={job.captcha_expires_in} onClose={() => setViewer(false)} />
+        )}
+
         {job && job.messages.length > (failed ? 0 : 1) && (
           <ol className="mt-6 space-y-1 border-t border-line pt-4 text-sm text-muted">
             {(failed ? job.messages : job.messages.slice(0, -1)).map((m, i) => (
               <li key={i}>{m}</li>
             ))}
           </ol>
+        )}
+
+        {job && !failed && job.status !== "done" && (
+          <div className="mt-4 flex justify-end">
+            <Button variant="ghost" disabled={cancelling} onClick={cancel}>
+              Annuler l&apos;extraction
+            </Button>
+          </div>
         )}
       </div>
 

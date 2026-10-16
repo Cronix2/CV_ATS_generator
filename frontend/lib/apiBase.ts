@@ -10,3 +10,8 @@ export function apiBase(raw: string | undefined): string {
   while (/\/api$/i.test(base)) base = base.slice(0, -4).replace(/\/+$/, "");
   return base || DEFAULT_API_URL;
 }
+
+/** WebSocket URL of an API route: same host, ws:// for http:// and wss:// for https://. */
+export function wsUrl(base: string, path: string): string {
+  return base.replace(/^http/i, "ws") + path;
+}

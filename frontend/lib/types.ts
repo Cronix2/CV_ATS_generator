@@ -78,16 +78,22 @@ export interface ServerConfig {
   llm: { server_key: boolean; base_url: string; model: string };
   docker: boolean;
   auth_required: boolean;
+  /** LinkedIn CAPTCHAs can be solved remotely (virtual screen shown with noVNC). */
+  remote_captcha?: boolean;
 }
 
 export interface Job<R = Profile> {
   id: string;
-  status: "running" | "needs_code" | "done" | "error";
+  status: "running" | "needs_code" | "needs_captcha" | "done" | "error";
   percent: number;
   messages: string[];
   prompt: string;
   error: string;
   result: R | null;
+  /** Seconds left to solve the CAPTCHA (status needs_captcha only). */
+  captcha_expires_in?: number | null;
+  /** Owner secret, only in the answer that creates the job. */
+  key?: string;
 }
 
 export type AgentName = "summary" | "experience" | "skills" | "cleanup" | "ats_review";
