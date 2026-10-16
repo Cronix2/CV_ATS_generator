@@ -175,6 +175,20 @@ la CI déclenche automatiquement :
 > branche par défaut**. Le tout premier déploiement automatique a donc lieu au
 > premier push sur `main` *après* la fusion de cette PR.
 
+### Déclenchement manuel
+
+Pour relancer un déploiement complet sans nouveau commit (par exemple après une
+correction côté serveur) : **Actions → Deploy to ServeurCasa → Run workflow**,
+branche `main`.
+
+- Le commit déployé est la tête actuelle de `main` ; toute autre branche est
+  refusée (job `resolve`).
+- Il faut qu'un run **CI** sur un push vers `main` ait **réussi** pour ce commit
+  exact ; sinon le workflow s'arrête avant tout build.
+- La suite est identique au déclenchement automatique : build arm64 natif,
+  publication et vérification GHCR, smoke test Chromium, déploiement du seul
+  projet `passefiltre` avec verrou, double contrôle de fraîcheur et rollback.
+
 ## 4. Premier déploiement
 
 1. Fusionner la PR `feat/cd-serveurcasa-arm64` dans `main`.

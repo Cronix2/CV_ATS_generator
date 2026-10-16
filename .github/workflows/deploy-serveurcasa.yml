@@ -2,6 +2,9 @@
 #
 # Flow:
 #   push to main  ->  CI workflow (ci.yml)  ->  [this workflow, only if CI succeeded]
+#   or manually: Actions -> Deploy to ServeurCasa -> Run workflow (branch `main` only)
+#     0. resolve: picks the commit to deploy. Manual run: the current tip of main, and only if a
+#                 CI run on a push to main SUCCEEDED for that exact commit (no untested deploy).
 #     1. build  : a GitHub-hosted NATIVE arm64 runner builds the arm64 images (no QEMU) and pushes
 #                 them to GHCR, tagged with the exact commit SHA that CI validated, then checks
 #                 that both tags point to the pushed linux/arm64 manifest.
@@ -15,6 +18,8 @@
 #   - Triggered via `workflow_run`, so this workflow (and its secrets) always runs from the
 #     version on the default branch, never from untrusted pull-request code.
 #   - Guards ensure it only runs for a *successful push to main* (never for pull requests).
+#   - Manual `workflow_dispatch` runs are refused unless dispatched from `main` (so the workflow
+#     file and the deployed code both come from main) and CI passed on that commit.
 #   - Least-privilege GITHUB_TOKEN; no long-lived credentials; images pinned by a commit-SHA
 #     tag (`sha-<commit>`). A tag is not cryptographically immutable — see the digest note in
 #     docs/deployment-serveurcasa.md for the difference with an OCI `@sha256:` digest.
@@ -27,6 +32,8 @@ on:
   workflow_run:
     workflows: ["CI"]
     types: [completed]
+  # Manual full redeploy of the tip of main (e.g. after fixing the server). Must be run from `main`.
+  workflow_dispatch:
 
 # Nothing by default; each job requests only what it needs.
 permissions: {}
@@ -39,15 +46,66 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Single source of truth for the commit to deploy, whatever the trigger.
+  resolve:
+    name: Resolve commit to deploy
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    permissions:
+      actions: read     # look up the CI run of the commit (manual runs)
+      contents: read
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - name: Resolve and validate the commit
+        id: sha
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "${EVENT}" in
+            workflow_run)
+              SHA="${RUN_SHA}" ;;
+            workflow_dispatch)
+              [ "${DISPATCH_REF}" = refs/heads/main ] \
+                || { echo "::error::Manual deploys must be run from the main branch (got ${DISPATCH_REF})."; exit 1; }
+              SHA="${DISPATCH_SHA}"
+              latest="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+              [ "${latest}" = "${SHA}" ] \
+                || { echo "::error::main moved to ${latest} after this run was dispatched; its own CI will deploy it."; exit 1; }
+              # The CI result of a push to main for this exact commit is the prerequisite test gate.
+              ok="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=push&branch=main&status=success&per_page=1" --jq '.total_count')"
+              [ "${ok}" -ge 1 ] \
+                || { echo "::error::No successful CI run (push to main) for ${SHA}. Wait for or re-run CI, then retry."; exit 1; }
+              echo "::notice::Manual deploy of main @ ${SHA} (CI passed on this commit)." ;;
+            *)
+              echo "::error::Unexpected trigger ${EVENT}."; exit 1 ;;
+          esac
+          [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid commit SHA '${SHA}'."; exit 1; }
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build & push arm64 images
     # Native arm64: under QEMU on an amd64 runner, Node crashed during `npm ci` (Illegal instruction).
+    needs: resolve
     runs-on: ubuntu-24.04-arm
-    # Only for a CI run that SUCCEEDED, that was a push (not a pull_request), on main.
+    # Only for a CI run that SUCCEEDED, that was a push (not a pull_request), on main — or a
+    # manual run from main (resolve has checked CI passed on that commit).
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main'
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     permissions:
       contents: read
       packages: write   # push to ghcr.io
@@ -80,7 +138,7 @@ jobs:
       # Build the Dockerfile exactly as it was at the commit CI validated.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
       - name: Check the runner is native arm64 (no emulation)
         run: test "$(uname -m)" = aarch64
@@ -100,7 +158,7 @@ jobs:
           build-args: ${{ matrix.build_args }}
           # Immutable, commit-pinned tag + a convenience `main` tag.
           tags: |
-            ghcr.io/cronix2/passefiltre-${{ matrix.name }}:sha-${{ github.event.workflow_run.head_sha }}
+            ghcr.io/cronix2/passefiltre-${{ matrix.name }}:sha-${{ needs.resolve.outputs.sha }}
             ghcr.io/cronix2/passefiltre-${{ matrix.name }}:main
           # Dedicated arm64 cache scope: never mixes with the amd64 CI/release caches.
           cache-from: type=gha,scope=${{ matrix.name }}-arm64
@@ -110,7 +168,7 @@ jobs:
       - name: Verify the images on GHCR (tags, digest, linux/arm64)
         env:
           REPO: ghcr.io/cronix2/passefiltre-${{ matrix.name }}
-          SHA: ${{ github.event.workflow_run.head_sha }}
+          SHA: ${{ needs.resolve.outputs.sha }}
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
@@ -135,16 +193,18 @@ jobs:
   # exact pushed image, before anything reaches the server.
   smoke:
     name: Browser smoke test (arm64)
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-24.04-arm
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main'
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     permissions:
       packages: read    # pull from ghcr.io
     env:
-      IMAGE: ghcr.io/cronix2/passefiltre-api:sha-${{ github.event.workflow_run.head_sha }}
+      IMAGE: ghcr.io/cronix2/passefiltre-api:sha-${{ needs.resolve.outputs.sha }}
     steps:
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -161,26 +221,28 @@ jobs:
 
   deploy:
     name: Deploy on ServeurCasa
-    needs: [build, smoke]
+    needs: [resolve, build, smoke]
     # The `passefiltre` label pins this to the dedicated runner, so another ARM64 self-hosted
     # runner (another repo/project) can never pick up this deployment job.
     runs-on: [self-hosted, Linux, ARM64, passefiltre]
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main'
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     permissions:
       contents: read
       packages: read    # pull from ghcr.io
     env:
       DEPLOY_DIR: /opt/passefiltre
-      SHA: ${{ github.event.workflow_run.head_sha }}
+      SHA: ${{ needs.resolve.outputs.sha }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       # Compose files matching the images we just built (staged under the deploy lock below).
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
 
       # Refuse to deploy a commit that is no longer the tip of main (a newer push won the race).
