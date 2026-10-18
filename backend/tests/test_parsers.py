@@ -153,3 +153,30 @@ def test_see_more_toggle_is_not_part_of_the_text():
                    '<button data-testid="expandable-text-button"><span>… plus</span></button></span>')
     assert _text(box.css("span")[0]) == "Ligne 1\nFin du texte."
     assert _text(Selector("<p>Résumé tronqué…see more</p>").css("p")[0]) == "Résumé tronqué"
+
+
+def test_light_page_blocks_only_heavy_resources():
+    # Regression (Raspberry Pi): images/videos/fonts kept LinkedIn pages from reaching "load" within the timeout.
+    from app.scraper.linkedin import _light_page
+
+    class Route:
+        def __init__(self, kind):
+            self.request = type("Req", (), {"resource_type": kind})()
+            self.done = None
+        def abort(self):
+            self.done = "abort"
+        def continue_(self):
+            self.done = "continue"
+
+    class Page:
+        def route(self, pattern, handler):
+            self.handler = handler
+
+    page = Page()
+    _light_page(page)
+    outcome = {}
+    for kind in ("image", "media", "font", "document", "script", "stylesheet", "xhr", "fetch"):
+        route = Route(kind)
+        page.handler(route)
+        outcome[kind] = route.done
+    assert {k for k, v in outcome.items() if v == "abort"} == {"image", "media", "font"}
