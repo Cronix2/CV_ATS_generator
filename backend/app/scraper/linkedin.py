@@ -8,6 +8,7 @@ log in from scratch every time, which is what triggers LinkedIn's checks.
 
 import hashlib
 import hmac
+import os
 import logging
 import re
 import secrets
@@ -30,6 +31,10 @@ log = logging.getLogger(__name__)
 
 SESSIONS_DIR = Path(__file__).resolve().parents[2] / ".sessions"
 DEBUG_DIR = Path(__file__).resolve().parents[3] / "debug"
+# Page.goto waits for the "load" event: on a slow host (Raspberry Pi) a LinkedIn page can take > 45 s.
+TIMEOUT_MS = int(float(os.getenv("SCRAPE_TIMEOUT", "90")) * 1000)
+# Useless for reading text, and what keeps a profile page from reaching "load" (photos, videos, fonts).
+HEAVY_RESOURCES = {"image", "media", "font"}
 
 # Profile attribute -> LinkedIn /details/ slug
 SECTIONS: dict[str, str] = {
@@ -361,6 +366,12 @@ def _scroll_and_expand(page) -> None:
     _expand_texts(page)
 
 
+def _light_page(page) -> None:
+    """page_setup for the pages we only read: skip heavy resources. Not used on login/CAPTCHA pages."""
+    page.route("**/*", lambda route: route.abort() if route.request.resource_type in HEAVY_RESOURCES
+               else route.continue_())
+
+
 def _profile_action(top: dict):
     """Profile page: read the top card, then load the lazy sections (About…) and expand their texts."""
     def action(page) -> None:
@@ -485,7 +496,7 @@ def _remote_login(email: str, password: str, hooks: Hooks, debug: bool) -> list[
     with captcha.RemoteBrowser() as remote, StealthySession(
         cdp_url=remote.cdp_url,
         locale="en-US",
-        timeout=45_000,
+        timeout=TIMEOUT_MS,
         retries=1,
         google_search=False,
         additional_args=remote.context_options(),
@@ -515,7 +526,7 @@ def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: s
         headless=headless,
         user_data_dir=user_data_dir,
         locale="en-US",  # stable UI labels/date formats for the parsers
-        timeout=45_000,
+        timeout=TIMEOUT_MS,
         retries=1,
         google_search=False,
         cookies=cookies or [],
@@ -525,7 +536,7 @@ def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: s
         hooks.progress("Lecture du profil…", 10)
 
         top: dict = {}
-        profile_page = session.fetch(base, page_action=_profile_action(top), wait=1000)
+        profile_page = session.fetch(base, page_action=_profile_action(top), page_setup=_light_page, wait=1000)
         if "/in/" not in str(profile_page.url) and "authwall" in str(profile_page.url):
             raise ScrapeError("Session LinkedIn invalide : reconnexion nécessaire.")
         basics = _parse_top_card(top, base)
@@ -534,7 +545,7 @@ def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: s
             raise ScrapeError("Profil introuvable ou inaccessible (vérifiez l'URL).")
 
         hooks.progress("Lecture des coordonnées…", 15)
-        contact = session.fetch(base + "overlay/contact-info/", wait=1500)
+        contact = session.fetch(base + "overlay/contact-info/", page_setup=_light_page, wait=1500)
         try:
             _parse_contact(contact, basics)
         except Exception:
@@ -548,7 +559,7 @@ def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: s
         for i, (attr, slug) in enumerate(SECTIONS.items()):
             _check_cancelled(hooks)
             hooks.progress(f"Section « {attr} »…", 20 + int(75 * i / len(SECTIONS)))
-            page = session.fetch(f"{base}details/{slug}/", page_action=_scroll_and_expand, wait=500)
+            page = session.fetch(f"{base}details/{slug}/", page_action=_scroll_and_expand, page_setup=_light_page, wait=500)
             if debug:
                 _dump(attr, page)
             try:  # one broken section must not kill the whole scrape
