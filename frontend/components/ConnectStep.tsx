@@ -11,6 +11,8 @@ import { Alert, Button, Field, IconTile, Input, Spinner } from "./ui";
 const PROVIDERS = [
   { label: "OpenAI", base_url: "", model: "gpt-4o-mini" },
   { label: "Paradigm (Orange LiveIntelligence)", base_url: "https://trust.liveintelligence.orange-business.com/api/v2", model: "alfred-4.2" },
+  // Anthropic's OpenAI-compatible endpoint: no extra dependency, same agent/tool flow as the others.
+  { label: "Anthropic (Claude)", base_url: "https://api.anthropic.com/v1", model: "claude-sonnet-5-5" },
   { label: "Mistral", base_url: "https://api.mistral.ai/v1", model: "mistral-small-latest" },
   { label: "OpenRouter", base_url: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini" },
   { label: "Ollama (local, nécessite ALLOW_LOCAL_LLM=1 dans .env)", base_url: "http://localhost:11434/v1", model: "llama3.1" },
@@ -103,7 +105,7 @@ export function ConnectStep() {
           <h2 className="text-lg font-semibold">Profil à extraire</h2>
         </div>
         {server?.auth_required && (
-          <Field label="Jeton d'accès PasseFiltre" hint="Ce serveur est protégé : demandez le jeton (PASSEFILTRE_TOKEN) à la personne qui l'héberge.">
+          <Field label="Jeton d'accès PasseFiltre" hint="Ce serveur est protégé : demandez le jeton (PASSEFILTRE_TOKEN) à la personne qui l'héberge. Il reste mémorisé sur cet appareil ; videz le champ pour l'oublier.">
             <Input type="password" required autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} />
           </Field>
         )}

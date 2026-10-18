@@ -76,6 +76,14 @@ function save(storage: () => Storage, key: string, value: unknown) {
     /* storage unavailable: state just won't survive a reload */
   }
 }
+function forget(key: string) {
+  try {
+    localStorage.removeItem(key);
+    sessionStorage.removeItem(key);
+  } catch {
+    /* storage unavailable: nothing was saved */
+  }
+}
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [cv, setCv] = useState<CV>(emptyCV);
@@ -93,7 +101,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // The API key stays in sessionStorage: forgotten when the tab is closed.
     const savedLlm = load<LLMConfig>(() => sessionStorage, LLM_KEY);
     if (savedLlm) setLlmState(savedLlm);
-    const savedToken = load<string>(() => sessionStorage, TOKEN_KEY);
+    // Remembered on this device (survives tab closes and redeploys); older versions kept it per tab.
+    const savedToken = load<string>(() => localStorage, TOKEN_KEY) ?? load<string>(() => sessionStorage, TOKEN_KEY);
     if (savedToken) {
       setApiToken(savedToken);
       setTokenState(savedToken);
@@ -109,7 +118,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const setToken = (v: string) => {
     setApiToken(v);
     setTokenState(v);
-    save(() => sessionStorage, TOKEN_KEY, v); // forgotten when the tab is closed
+    // Saved on this device; an empty field forgets it.
+    if (v.trim()) save(() => localStorage, TOKEN_KEY, v);
+    else forget(TOKEN_KEY);
   };
 
   const setLlm = (v: LLMConfig) => {
