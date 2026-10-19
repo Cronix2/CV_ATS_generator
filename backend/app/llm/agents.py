@@ -199,11 +199,16 @@ def explain_error(e: Exception) -> str:
     return "Erreur inattendue avec le LLM (détail dans les logs du serveur)."
 
 
+# Recent Claude models and OpenAI reasoning models reject a custom temperature ("deprecated for this model").
+NO_TEMPERATURE = ("claude", "o1", "o3", "o4", "gpt-5")
+
+
 def make_llm(cfg: LLMConfig) -> ChatOpenAI:
     cfg = cfg.resolved()
+    temperature = None if cfg.model.strip().lower().startswith(NO_TEMPERATURE) else 0.3  # None = not sent
     return ChatOpenAI(
         api_key=cfg.api_key, base_url=normalize_base_url(cfg.base_url), model=cfg.model,
-        temperature=0.3, timeout=180, max_retries=2,
+        temperature=temperature, timeout=180, max_retries=2,
     )
 
 

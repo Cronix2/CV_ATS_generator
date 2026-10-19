@@ -106,6 +106,7 @@ Un déploiement continu vers un serveur ARM64 (Raspberry Pi) est décrit dans [d
 ## Sécurité
 
 - **Accès** : écoute sur `127.0.0.1` par défaut (lanceur et Docker). Jeton `PASSEFILTRE_TOKEN` (obligatoire en réseau), contrôle de l'en-tête `Host` (DNS rebinding), requêtes cross-site refusées (vérification de `Origin` et `Content-Type: application/json` exigé sur les POST, donc pas de POST « simple » sans preflight CORS).
+- **Réseau local** : depuis une IP privée (box, Wi-Fi de la maison) ou la machine elle-même, le jeton n'est pas demandé ; il reste exigé pour toute IP publique. `TRUST_LAN=0` le rend obligatoire partout (à faire avant tout tunnel ou VPN qui relaierait Internet).
 - **Sessions LinkedIn** : chaque session est rangée dans un dossier dérivé, par HMAC avec un secret propre à l'installation, de l'e-mail **et** du mot de passe. Connaître l'e-mail de quelqu'un ne suffit pas pour réutiliser sa session. Le bouton « Oublier ma session LinkedIn » l'efface du serveur (il faut les mêmes identifiants).
 - **Navigateur visible** : réservé à la machine qui héberge PasseFiltre ; un client distant ne peut pas ouvrir de fenêtre sur ce poste.
 - **Agent IA** : il ne voit ni votre e-mail ni votre téléphone, et ne peut lire que les pages données dans votre demande, le lien de l'offre ou les résultats de ses recherches. Les URL locales et privées sont refusées pour la lecture de pages comme pour l'URL du LLM saisie dans l'interface (contrôle `is_global`, puis nouveau contrôle sur l'URL finale).
