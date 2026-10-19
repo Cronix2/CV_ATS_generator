@@ -89,6 +89,21 @@ def is_local_client(request: Request) -> bool:
     return _is_loopback(client_ip(request))
 
 
+def token_required(request: HTTPConnection) -> bool:
+    """The token protects against the outside world, not the home network: clients on a private network
+    (LAN, this machine) skip it unless TRUST_LAN=0. Behind Caddy the client IP is reliable (it overwrites
+    X-Forwarded-For). ponytail: trusts every private range; set TRUST_LAN=0 before adding a tunnel/VPN proxy."""
+    if not api_token():
+        return False
+    if os.getenv("TRUST_LAN", "1") == "0":
+        return True
+    try:
+        ip = ipaddress.ip_address(client_ip(request))
+    except ValueError:
+        return True
+    return not (ip.is_private or ip.is_loopback)
+
+
 def pseudonym(value: str) -> str:
     """Stable, non-reversible tag for audit logs (never log raw emails)."""
     return hashlib.sha256(value.strip().lower().encode()).hexdigest()[:12]
@@ -115,10 +130,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             # A JSON content type forces the CORS preflight, so "simple" cross-site POSTs are impossible.
             if method == "POST" and not request.headers.get("content-type", "").startswith("application/json"):
                 return self._deny(415, "Content-Type application/json requis.")
-            token = api_token()
-            if token and path not in PUBLIC_PATHS:
+            if path not in PUBLIC_PATHS and token_required(request):
                 given = request.headers.get(TOKEN_HEADER, "")
-                if not secrets.compare_digest(given.encode(), token.encode()):
+                if not secrets.compare_digest(given.encode(), api_token().encode()):
                     audit(request, "token_refused", path=path)
                     return self._deny(401, "Jeton d'accès manquant ou invalide.")
         response = await call_next(request)

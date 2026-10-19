@@ -25,8 +25,8 @@ from app.models import CV
 from app.scraper import captcha
 from app.scraper.linkedin import forget_session, normalize_profile_url, scrape_profile
 from app.security import (
-    JOB_KEY_HEADER, TOKEN_HEADER, PublicError, SecurityMiddleware, allowed_hosts, api_token, assert_safe_config,
-    audit, cors_origins, is_local_client, pseudonym,
+    JOB_KEY_HEADER, TOKEN_HEADER, PublicError, SecurityMiddleware, allowed_hosts, assert_safe_config,
+    audit, cors_origins, is_local_client, pseudonym, token_required,
 )
 
 log = logging.getLogger(__name__)
@@ -113,9 +113,10 @@ def health():
 
 
 @app.get("/api/config")
-def config():
-    """Server-side defaults the UI adapts to (never exposes secrets)."""
-    return {"llm": server_llm(), "docker": os.path.exists("/.dockerenv"), "auth_required": bool(api_token()),
+def config(request: Request):
+    """Server-side defaults the UI adapts to (never exposes secrets). auth_required is per client:
+    no token field on the home network."""
+    return {"llm": server_llm(), "docker": os.path.exists("/.dockerenv"), "auth_required": token_required(request),
             "remote_captcha": captcha.available()}
 
 

@@ -282,3 +282,31 @@ def test_audit_log_records_actions_without_secrets(monkeypatch, client):
 def test_api_docs_disabled_by_default(client):
     assert client.get("/docs").status_code == 404
     assert client.get("/openapi.json").status_code == 404
+
+
+# --- Réseau local sans jeton, jeton toujours exigé depuis Internet --------------------------------
+
+@pytest.mark.parametrize("ip,needs_token", [("192.168.1.20", False), ("198.18.0.5", False), ("10.0.0.7", False),
+                                            ("127.0.0.1", False), ("fd00::5", False),
+                                            ("8.8.8.8", True), ("100.64.0.9", True)])
+def test_token_only_required_outside_the_home_network(monkeypatch, ip, needs_token):
+    monkeypatch.setenv("PASSEFILTRE_TOKEN", "s3cret")
+    monkeypatch.delenv("TRUST_LAN", raising=False)
+    lan = TestClient(app, base_url="http://localhost", client=(ip, 50000))
+    cv = {"profile": {"basics": {"full_name": "Jane"}}}
+    assert lan.post("/api/export/pdf", json=cv).status_code == (401 if needs_token else 200)
+    assert lan.get("/api/config").json()["auth_required"] is needs_token  # the UI hides the field on the LAN
+
+
+def test_trust_lan_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("PASSEFILTRE_TOKEN", "s3cret")
+    monkeypatch.setenv("TRUST_LAN", "0")
+    lan = TestClient(app, base_url="http://localhost", client=("192.168.1.20", 50000))
+    assert lan.post("/api/export/pdf", json={"profile": {}}).status_code == 401
+
+
+def test_no_temperature_for_models_that_reject_it():
+    from app.llm.agents import make_llm
+    claude = make_llm(LLMConfig(api_key="k", base_url="https://api.anthropic.com/v1", model="claude-sonnet-5-5"))
+    gpt = make_llm(LLMConfig(api_key="k", model="gpt-4o-mini"))
+    assert claude.temperature is None and gpt.temperature == 0.3
