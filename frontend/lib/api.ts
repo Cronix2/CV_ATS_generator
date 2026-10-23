@@ -42,6 +42,7 @@ async function call<T>(path: string, body?: unknown, extra: { method?: string; h
 }
 
 export const api = {
+  ats: (cv: CV) => call<import("./ats").ATSAnalysis>("/api/ats", cv),
   startScrape: (b: { profile_url: string; email: string; password: string; show_browser: boolean }) =>
     call<Job>("/api/scrape", b).then(remember),
   job: <R = Profile>(id: string) => call<Job<R>>(`/api/jobs/${id}`, undefined, { headers: jobHeaders(id) }),

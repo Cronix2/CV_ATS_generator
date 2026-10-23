@@ -3,13 +3,15 @@
 import { ChevronDown, CircleCheck, CircleX, Gauge } from "lucide-react";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { qualityChecks } from "@/lib/ats";
+import { useATS } from "@/lib/ats";
 import { useStore } from "@/lib/store";
 import { Spinner } from "./ui";
 
 function QualityPanel() {
   const { cv } = useStore();
-  const { score, checks } = qualityChecks(cv);
+  const ats = useATS(cv);
+  if (!ats.data) return <p className="p-3 text-sm text-muted">{ats.error || "Analyse ATS…"}</p>;
+  const { score, checks } = ats.data;
   const color = score >= 80 ? "var(--color-ok)" : score >= 50 ? "var(--color-warn)" : "var(--color-danger)";
   const todo = checks.filter((c) => !c.ok);
 

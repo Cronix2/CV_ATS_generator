@@ -3,7 +3,7 @@
 import { Link2, Target as TargetIcon, WandSparkles } from "lucide-react";
 import { useState } from "react";
 import { api } from "@/lib/api";
-import { extractKeywords, keywordMatch } from "@/lib/ats";
+import { useATS } from "@/lib/ats";
 import { useStore } from "@/lib/store";
 import type { Target } from "@/lib/types";
 import { Alert, Button, Card, Chip, Field, Input, Spinner, Textarea } from "./ui";
@@ -16,7 +16,8 @@ export function TargetCard() {
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState("");
   const [draft, setDraft] = useState("");
-  const match = keywordMatch(cv);
+  const ats = useATS(cv);
+  const match = ats.data ?? { keywords: t.keywords, found: [], missing: [], percent: null };
 
   const set = (patch: Partial<Target>) =>
     update((c) => ({ ...c, settings: { ...c.settings, target: { ...c.settings.target, ...patch } } }));
@@ -26,7 +27,7 @@ export function TargetCard() {
     setError("");
     try {
       const { text } = await api.importOffer(t.offer_url);
-      set({ offer_text: text, keywords: t.keywords.length ? t.keywords : extractKeywords(text) });
+      set({ offer_text: text });
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -71,6 +72,7 @@ export function TargetCard() {
           </div>
         </Field>
         {error && <Alert>{error}</Alert>}
+        {ats.error && <Alert>{ats.error}</Alert>}
         <Field label="Texte de l'offre">
           <Textarea rows={6} value={t.offer_text} onChange={(e) => set({ offer_text: e.target.value })} placeholder="Collez ici l'annonce : missions, profil recherché, compétences…" />
         </Field>
@@ -82,7 +84,7 @@ export function TargetCard() {
               {t.keywords.length ? "liste personnalisée" : match.keywords.length ? "suggérés automatiquement" : ""}
             </span>
             {t.offer_text && (
-              <Button variant="ghost" className="ml-auto px-2 py-1 text-xs" onClick={() => set({ keywords: extractKeywords(t.offer_text) })}>
+              <Button variant="ghost" className="ml-auto px-2 py-1 text-xs" disabled={!ats.data} onClick={() => set({ keywords: ats.data?.suggested_keywords ?? [] })}>
                 <WandSparkles className="size-3.5" aria-hidden /> Réextraire
               </Button>
             )}

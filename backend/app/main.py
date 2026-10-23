@@ -2,8 +2,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
-import unicodedata
 from urllib.parse import urlparse
 
 import anyio
@@ -15,15 +13,12 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from app import jobs
-from app.export.content import build
-from app.export.docx_export import render_docx
-from app.export.pdf_export import render_pdf
-from app.llm.agents import AGENTS, LLMConfig, enhance, explain_error, server_llm, test_connection
-from app.llm.supervisor import run_agent
-from app.llm.tools import fetch_page_text
+from app.services.cv import download_name, render
+from app.llm.agents import AGENTS, LLMConfig, explain_error, server_llm
+from app.services.operations import enhance, test_llm as test_connection, converse as run_agent, offer as fetch_page_text, extract as scrape_profile, forget as forget_session
 from app.models import CV
 from app.scraper import captcha
-from app.scraper.linkedin import forget_session, normalize_profile_url, scrape_profile
+from app.scraper.linkedin import normalize_profile_url
 from app.security import (
     JOB_KEY_HEADER, TOKEN_HEADER, PublicError, SecurityMiddleware, allowed_hosts, assert_safe_config,
     audit, cors_origins, is_local_client, pseudonym, token_required,
@@ -311,21 +306,16 @@ def llm_enhance(req: EnhanceRequest, request: Request):
         raise HTTPException(502, f"Erreur LLM : {explain_error(e)}")
 
 
-def download_name(full_name: str, fmt: str) -> str:
-    """ASCII-only, header-safe file name: « Jérôme "J" O'Neil » -> CV-Jerome-J-ONeil.pdf"""
-    ascii_name = unicodedata.normalize("NFKD", full_name).encode("ascii", "ignore").decode()
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", ascii_name.replace("'", "")).strip("-")[:60] or "cv"
-    return f"CV-{slug}.{fmt}"
-
-
 @app.post("/api/export/{fmt}")
 def export(fmt: str, cv: CV):
-    layout = build(cv)
-    if fmt == "pdf":
-        data, mime = render_pdf(layout), "application/pdf"
-    elif fmt == "docx":
-        data, mime = render_docx(layout), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    else:
+    if fmt not in ("pdf", "docx"):
         raise HTTPException(404, "Format inconnu (pdf ou docx).")
-    return Response(data, media_type=mime,
-                    headers={"Content-Disposition": f'attachment; filename="{download_name(layout.name, fmt)}"'})
+    rendered = render(cv, fmt)
+    return Response(rendered.data, media_type=rendered.mime,
+                    headers={"Content-Disposition": f'attachment; filename="{rendered.filename}"'})
+
+
+@app.post("/api/ats")
+def ats_analysis(cv: CV):
+    from app.services.ats import analyse
+    return analyse(cv)
