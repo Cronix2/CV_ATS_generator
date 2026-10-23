@@ -214,7 +214,7 @@ def _login(session: StealthySession, email: str, password: str, hooks: Hooks, he
     if errors:
         if isinstance(errors[0], ScrapeError):
             raise errors[0]
-        log.error("LinkedIn login failed: %r", errors[0])  # browser internals stay in the logs
+        log.error("LinkedIn login failed")  # browser internals stay in the logs
         raise ScrapeError("Échec de la connexion à LinkedIn. Réessayez, ou cochez « Afficher le navigateur » pour voir ce qui bloque.")
 
 
@@ -521,7 +521,7 @@ def _linkedin_cookies(cookies: list[dict]) -> list[dict]:
 
 
 def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: str, headless: bool, debug: bool,
-            cookies: list[dict] | None = None) -> Profile:
+            cookies: list[dict] | None = None, save_cookies=None) -> Profile:
     with StealthySession(
         headless=headless,
         user_data_dir=user_data_dir,
@@ -549,7 +549,7 @@ def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: s
         try:
             _parse_contact(contact, basics)
         except Exception:
-            log.exception("Contact info parsing failed")
+            log.error("Contact info parsing failed")
             hooks.progress("Coordonnées non lues : à compléter à la main.")
         profile = Profile(basics=basics)
         if debug:
@@ -566,10 +566,12 @@ def _scrape(base: str, email: str, password: str, hooks: Hooks, user_data_dir: s
                 if not _empty_section(page):
                     setattr(profile, attr, PARSERS[attr](_entries(page)))
             except Exception:
-                log.exception("Parsing failed for %s", attr)
+                log.error("Parsing failed for %s", attr)
                 hooks.progress(f"Section « {attr} » ignorée (lecture impossible).")
             time.sleep(1)  # be gentle with LinkedIn
         hooks.progress("Extraction terminée.", 100)
+        if save_cookies is not None:
+            save_cookies(_linkedin_cookies(session.context.cookies()))
         return profile
 
 

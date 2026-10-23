@@ -111,8 +111,10 @@ def pseudonym(value: str) -> str:
 
 def audit(request: HTTPConnection, action: str, **details: object) -> None:
     """One line per sensitive action. Never pass passwords, API keys or CV content here."""
-    fields = " ".join(f"{k}={v}" for k, v in details.items())
-    audit_log.info("action=%s ip=%s %s", action, client_ip(request), fields)
+    # Only bounded technical metadata; URLs, profile handles and client IPs are personal data.
+    safe = {k: v for k, v in details.items() if k in {"job", "removed", "show_browser", "origin_ok", "instruction_chars", "account"}}
+    fields = " ".join(f"{k}={v}" for k, v in safe.items())
+    audit_log.info("action=%s client_ref=%s %s", action, pseudonym(client_ip(request)), fields)
 
 
 # --------------------------------------------------------------------------- middleware
@@ -126,21 +128,30 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             # Cross-site requests: a browser always sends Origin on POST/DELETE; only our UI may call the API.
             origin = request.headers.get("origin")
             if method in ("POST", "PUT", "PATCH", "DELETE") and origin and origin not in cors_origins():
-                return self._deny(403, "Origine non autorisée.")
+                return self._deny(403, "Origine non autorisée.", request)
             # A JSON content type forces the CORS preflight, so "simple" cross-site POSTs are impossible.
             if method == "POST" and not request.headers.get("content-type", "").startswith("application/json"):
-                return self._deny(415, "Content-Type application/json requis.")
-            if path not in PUBLIC_PATHS and token_required(request):
+                return self._deny(415, "Content-Type application/json requis.", request)
+            if path not in PUBLIC_PATHS and not (os.getenv("API_V1_ENABLED") == "1" and (path == "/api/v1" or path.startswith("/api/v1/"))) and token_required(request):
                 given = request.headers.get(TOKEN_HEADER, "")
                 if not secrets.compare_digest(given.encode(), api_token().encode()):
                     audit(request, "token_refused", path=path)
-                    return self._deny(401, "Jeton d'accès manquant ou invalide.")
+                    return self._deny(401, "Jeton d'accès manquant ou invalide.", request)
         response = await call_next(request)
         response.headers.update(SECURITY_HEADERS)
         return response
 
     @staticmethod
-    def _deny(status: int, message: str) -> JSONResponse:
+    def _deny(status: int, message: str, request: Request) -> JSONResponse:
+        if os.getenv("API_V1_ENABLED") == "1" and request.url.path.startswith("/api/v1/"):
+            from uuid import uuid4
+            request_id = uuid4().hex
+            return JSONResponse(
+                {"code": {403: "forbidden", 415: "unsupported_media_type", 401: "unauthorized"}[status],
+                 "message": message, "request_id": request_id},
+                status_code=status,
+                headers={**SECURITY_HEADERS, "Cache-Control": "no-store", "X-Request-Id": request_id},
+            )
         return JSONResponse({"detail": message}, status_code=status, headers=SECURITY_HEADERS)
 
 

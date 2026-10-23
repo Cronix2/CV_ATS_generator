@@ -4,7 +4,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/passefiltre-api-v1]
   pull_request:
 
 # Least privilege: the CI only reads the repository.
@@ -19,6 +19,25 @@ jobs:
   backend:
     name: Backend (tests)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: test-admin-only
+          POSTGRES_DB: passefiltre_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d passefiltre_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      PF_TEST_ADMIN_URL: postgresql+psycopg://postgres:test-admin-only@127.0.0.1:5432/passefiltre_test
+      PF_TEST_APP_URL: postgresql+psycopg://pf_app:test-app-only@127.0.0.1:5432/passefiltre_test
+      PF_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      PF_REQUIRE_V1_TESTS: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -28,8 +47,16 @@ jobs:
           cache-dependency-path: backend/requirements*.lock
       - run: pip install --require-hashes -r requirements-dev.lock
         working-directory: backend
+      - run: python scripts/prepare_v1_test_db.py
+        working-directory: backend
       - run: python -m pytest -q
         working-directory: backend
+      - run: python scripts/export_openapi.py --check
+        working-directory: backend
+      - name: Validate optional v1 Compose overlay
+        env:
+          V1_ENCRYPTION_KEY: test-compose-only-not-a-runtime-key
+        run: docker compose --env-file .env.v1.example -f docker-compose.yml -f docker-compose.v1.yml config -q
 
   frontend:
     name: Frontend (types + build)

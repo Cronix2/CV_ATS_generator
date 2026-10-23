@@ -1,0 +1,11 @@
+{
+  "schema_version": "1",
+  "cv": {
+    "profile": {
+      "basics": {"full_name": "Camille Exemple", "headline": "Développement Python"},
+      "experience": [{"id": "exp-demo-1", "title": "Développement logiciel", "company": "Entreprise fictive", "description": "Maintenance d'une API Python."}],
+      "skills": [{"id": "skill-demo-1", "name": "Python"}]
+    },
+    "settings": {"language": "fr"}
+  }
+}

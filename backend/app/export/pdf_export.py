@@ -36,7 +36,7 @@ def _p(text: str, style: str | ParagraphStyle, **kw) -> Paragraph:
 def render_pdf(layout: Layout) -> bytes:
     buf = BytesIO()
     doc = SimpleDocTemplate(
-        buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
+        buf, invariant=1, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=15 * mm, bottomMargin=15 * mm,
         title=f"CV - {layout.name}", author=layout.name, subject=layout.headline,
     )
     # Colour only on the name and section titles: text stays plain, so ATS parsing is unaffected.

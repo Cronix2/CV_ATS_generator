@@ -276,7 +276,7 @@ def test_audit_log_records_actions_without_secrets(monkeypatch, client):
     finally:
         logging.getLogger("passefiltre.audit").removeHandler(handler)
     line = next(r for r in records if "action=scrape" in r)
-    assert "profile=jane" in line and "Sup3rS3cret" not in line and "jane@example.com" not in line
+    assert "profile=jane" not in line and "Sup3rS3cret" not in line and "jane@example.com" not in line
 
 
 def test_api_docs_disabled_by_default(client):

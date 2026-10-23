@@ -2,8 +2,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
-import unicodedata
 from urllib.parse import urlparse
 
 import anyio
@@ -15,15 +13,12 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from app import jobs
-from app.export.content import build
-from app.export.docx_export import render_docx
-from app.export.pdf_export import render_pdf
-from app.llm.agents import AGENTS, LLMConfig, enhance, explain_error, server_llm, test_connection
-from app.llm.supervisor import run_agent
-from app.llm.tools import fetch_page_text
+from app.services.cv import download_name, render
+from app.llm.agents import AGENTS, LLMConfig, explain_error, server_llm
+from app.services.operations import enhance, test_llm as test_connection, converse as run_agent, offer as fetch_page_text, extract as scrape_profile, forget as forget_session
 from app.models import CV
 from app.scraper import captcha
-from app.scraper.linkedin import forget_session, normalize_profile_url, scrape_profile
+from app.scraper.linkedin import normalize_profile_url
 from app.security import (
     JOB_KEY_HEADER, TOKEN_HEADER, PublicError, SecurityMiddleware, allowed_hosts, assert_safe_config,
     audit, cors_origins, is_local_client, pseudonym, token_required,
@@ -44,9 +39,9 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins(),
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type", TOKEN_HEADER, JOB_KEY_HEADER],
-    expose_headers=["Content-Disposition"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Content-Type", TOKEN_HEADER, JOB_KEY_HEADER, "Authorization", "Idempotency-Key", "X-PasseFiltre-User-Id", "If-Match"],
+    expose_headers=["Content-Disposition", "ETag", "Location", "Retry-After", "X-Content-SHA256", "X-PasseFiltre-Version", "X-Request-Id"],
 )
 
 
@@ -117,7 +112,8 @@ def config(request: Request):
     """Server-side defaults the UI adapts to (never exposes secrets). auth_required is per client:
     no token field on the home network."""
     return {"llm": server_llm(), "docker": os.path.exists("/.dockerenv"), "auth_required": token_required(request),
-            "remote_captcha": captcha.available()}
+            "remote_captcha": captcha.available(),
+            "persistent_workflows": os.getenv("API_V1_ENABLED") == "1" and bool(os.getenv("V1_UI_SERVICE_KEY"))}
 
 
 @app.post("/api/scrape")
@@ -203,63 +199,8 @@ async def captcha_vnc(ws: WebSocket, job_id: str):
         audit(ws, "captcha_vnc_refused", job=job_id[:32], origin_ok=origin_ok)
         await ws.close(code=1008)
         return
-    display = job.display
-    sock = display.vnc_socket if display else None
-    try:
-        if not sock:
-            raise OSError("no VNC server")
-        reader, writer = await asyncio.open_unix_connection(sock)
-    except (OSError, AttributeError, NotImplementedError):
-        await ws.close(code=1011)
-        return
-
-    async def to_vnc() -> None:
-        while True:
-            message = await ws.receive()
-            if message["type"] == "websocket.disconnect":
-                raise WebSocketDisconnect(message.get("code", 1000))
-            data = message.get("bytes")
-            if data is None:  # RFB is binary only: a text frame is a protocol error
-                await ws.close(code=1003)
-                return
-            writer.write(data)
-            await writer.drain()
-
-    async def to_browser() -> None:
-        while data := await reader.read(65536):
-            await ws.send_bytes(data)
-
-    async def until_closed() -> None:  # solved, expired or cancelled: cut the viewer even if VNC lingers
-        while job.status == "needs_captcha" and job.display is display:
-            await anyio.sleep(1)
-
-    # Structured concurrency (anyio, like Starlette itself): a cancellation of this handler (client
-    # gone, server shutdown) reaches the pumps and leaves as the canceller's own cancellation, never
-    # as a stray CancelledError; an unexpected pump error propagates instead of being swallowed.
-    try:
-        await ws.accept(subprotocol="binary" if "binary" in offered else None)
-        audit(ws, "captcha_vnc_open", job=job.id)
-        async with anyio.create_task_group() as pumps:
-            async def pump(side) -> None:
-                try:
-                    await side()
-                except (WebSocketDisconnect, ConnectionError):
-                    pass  # the browser or the VNC server hung up: the normal end of a session
-                pumps.cancel_scope.cancel()  # whichever side ends first ends the whole bridge
-
-            for side in (to_vnc, to_browser, until_closed):
-                pumps.start_soon(pump, side)
-    finally:
-        # Release both ends even if this handler is being cancelled: shielded, but bounded so a
-        # stuck peer cannot hold the handler.
-        with anyio.move_on_after(VNC_CLOSE_TIMEOUT, shield=True):
-            writer.close()
-            with contextlib.suppress(OSError):  # the VNC server may already have reset the socket
-                await writer.wait_closed()
-            if ws.application_state is WebSocketState.CONNECTED:
-                with contextlib.suppress(WebSocketDisconnect):  # the browser is already gone
-                    await ws.close()
-        audit(ws, "captcha_vnc_close", job=job.id)
+    from app.services.captcha_bridge import bridge
+    await bridge(ws, job)
 
 
 @app.post("/api/agent")
@@ -271,7 +212,7 @@ def start_agent(req: AgentRequest, request: Request):
         try:
             return run_agent(req.llm, req.cv, req.instruction, req.history, job)
         except Exception as e:
-            log.exception("Agent run failed")
+            log.error("Agent run failed")
             raise PublicError(explain_error(e)) from e
 
     started = _start(run)
@@ -287,7 +228,7 @@ def import_offer(req: OfferRequest, request: Request):
     except PublicError as e:
         raise HTTPException(400, f"Impossible de lire l'offre : {e}")
     except Exception:
-        log.exception("Offer import failed for %s", req.url)
+        log.error("Offer import failed")
         raise HTTPException(400, "Impossible de lire l'offre (page inaccessible). Collez plutôt son texte.")
 
 
@@ -297,7 +238,7 @@ def llm_test(cfg: LLMConfig, request: Request):
     try:
         return {"ok": True, "reply": test_connection(cfg)}
     except Exception as e:
-        log.warning("LLM test failed: %s", e)
+        log.warning("LLM test failed")
         raise HTTPException(400, f"Connexion au LLM impossible : {explain_error(e)}")
 
 
@@ -307,25 +248,46 @@ def llm_enhance(req: EnhanceRequest, request: Request):
     try:
         return enhance(req.llm, req.cv, req.job_description, req.agents)
     except Exception as e:
-        log.exception("Enhance failed")
+        log.error("Enhance failed")
         raise HTTPException(502, f"Erreur LLM : {explain_error(e)}")
-
-
-def download_name(full_name: str, fmt: str) -> str:
-    """ASCII-only, header-safe file name: « Jérôme "J" O'Neil » -> CV-Jerome-J-ONeil.pdf"""
-    ascii_name = unicodedata.normalize("NFKD", full_name).encode("ascii", "ignore").decode()
-    slug = re.sub(r"[^A-Za-z0-9]+", "-", ascii_name.replace("'", "")).strip("-")[:60] or "cv"
-    return f"CV-{slug}.{fmt}"
 
 
 @app.post("/api/export/{fmt}")
 def export(fmt: str, cv: CV):
-    layout = build(cv)
-    if fmt == "pdf":
-        data, mime = render_pdf(layout), "application/pdf"
-    elif fmt == "docx":
-        data, mime = render_docx(layout), "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    else:
+    if fmt not in ("pdf", "docx"):
         raise HTTPException(404, "Format inconnu (pdf ou docx).")
-    return Response(data, media_type=mime,
-                    headers={"Content-Disposition": f'attachment; filename="{download_name(layout.name, fmt)}"'})
+    rendered = render(cv, fmt)
+    return Response(rendered.data, media_type=rendered.mime,
+                    headers={"Content-Disposition": f'attachment; filename="{rendered.filename}"'})
+
+
+@app.post("/api/ats")
+def ats_analysis(cv: CV):
+    from app.services.ats import analyse
+    return analyse(cv)
+
+
+if os.getenv("API_V1_ENABLED") == "1":
+    from app.v1.api import app as v1_app
+    from app.v1 import captcha as v1_captcha
+    app.mount("/api/v1", v1_app)
+    from app.v1.legacy import router as workflow_ui
+    from app.v1.errors import APIError
+    from fastapi.responses import JSONResponse
+    app.include_router(workflow_ui)
+
+    @app.exception_handler(APIError)
+    async def ui_error(request, exc):
+        return JSONResponse({"detail": exc.message}, status_code=exc.status,
+                            headers={"Retry-After": str(exc.retry_after)} if exc.retry_after else {})
+
+    @app.on_event("startup")
+    def validate_v1_config():
+        from app.v1.db import check
+        from app.v1.crypto import key
+        from app.v1.settings import validate
+        validate()
+        key()
+        if not os.getenv("V1_REDIS_URL"):
+            raise RuntimeError("V1_REDIS_URL required")
+        check()

@@ -189,7 +189,7 @@ class RemoteBrowser:
                 raise PublicError(BUSY) from None
             log.error("captcha-browser %s %s: HTTP %s", method, path or "/session", e.code)
         except (OSError, ValueError) as e:
-            log.error("captcha-browser %s %s: %r", method, path or "/session", e)
+            log.error("captcha-browser connection failed")
         raise PublicError(UNAVAILABLE)
 
     def __enter__(self) -> "RemoteBrowser":

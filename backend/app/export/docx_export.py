@@ -1,6 +1,8 @@
 """ATS-friendly DOCX: built-in Heading/List styles, no tables, text boxes or header/footer content."""
 
 from io import BytesIO
+from datetime import datetime, timezone
+from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -45,6 +47,9 @@ def render_docx(layout: Layout) -> bytes:
     normal.element.rPr.rFonts.set(qn("w:eastAsia"), "Calibri")
     doc.core_properties.title = f"CV - {layout.name}"
     doc.core_properties.author = layout.name
+    doc.core_properties.created = doc.core_properties.modified = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    doc.core_properties.last_modified_by = "PasseFiltre"
+    doc.core_properties.revision = 1
 
     center = WD_ALIGN_PARAGRAPH.CENTER
     accent = RGBColor.from_string(layout.accent.lstrip("#").upper())
@@ -77,4 +82,11 @@ def render_docx(layout: Layout) -> bytes:
 
     buf = BytesIO()
     doc.save(buf)
-    return buf.getvalue()
+    # OPC ZIP timestamps otherwise depend on wall clock, even with fixed document metadata.
+    stable = BytesIO()
+    with ZipFile(buf) as source, ZipFile(stable, "w") as target:
+        for name in sorted(source.namelist()):
+            info = ZipInfo(name, date_time=(2000, 1, 1, 0, 0, 0))
+            info.compress_type = ZIP_DEFLATED
+            target.writestr(info, source.read(name))
+    return stable.getvalue()

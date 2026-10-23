@@ -4,6 +4,7 @@ import { Download, FileDown, FileText, Palette } from "lucide-react";
 import { useState } from "react";
 import { api, download } from "@/lib/api";
 import { useStore } from "@/lib/store";
+import { WorkflowPanel } from "./WorkflowPanel";
 import { Alert, Button, Spinner } from "./ui";
 
 const ACCENTS = [
@@ -50,6 +51,8 @@ export function ExportStep() {
         <h1 className="text-2xl font-semibold tracking-tight">Télécharger le CV</h1>
         <p className="mt-1 text-sm text-muted">Le PDF est celui de l&apos;aperçu. Le Word est utile quand un site de candidature le demande.</p>
       </div>
+
+      <WorkflowPanel />
 
       <section className="space-y-4 rounded-lg border border-line bg-white p-5">
         <fieldset>

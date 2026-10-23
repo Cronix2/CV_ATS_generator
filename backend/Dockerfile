@@ -39,6 +39,8 @@ COPY chromium-policies.json /etc/opt/chrome/policies/managed/passefiltre.json
 COPY chromium-policies.json /etc/opt/chrome_for_testing/policies/managed/passefiltre.json
 
 COPY app ./app
+COPY alembic.ini ./
+COPY migrations ./migrations
 
 USER app
 # Fail the build if the Chromium that patchright expects is missing (no launch: works under QEMU).
