@@ -14,6 +14,7 @@ Aucun déploiement, aucune fusion, aucune modification de secret ou donnée de p
 | Frontend | 3 fichiers de tests réussis ; TypeScript `--noEmit` réussi |
 | Build Next.js | Construction de production réussie lors de la validation frontend ; aucun changement frontend depuis |
 | OpenAPI | Artefact généré puis vérifié par `export_openapi.py --check` |
+| Exemple Python de bout en bout | Réussi contre Uvicorn, PostgreSQL, Redis, Celery et scheduler réels ; PDF et DOCX produits après approbation d'un CV fictif |
 | Compose v1 | `docker compose ... config -q` réussi avec valeurs fictives |
 | Image API amd64 | Construction et contrôle statique du chemin Chromium réussis |
 | Lancement navigateur dans l'image locale | **Bloqué** : Docker a épuisé le disque de l'environnement au démarrage du conteneur |
