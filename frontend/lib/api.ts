@@ -42,6 +42,28 @@ async function call<T>(path: string, body?: unknown, extra: { method?: string; h
 }
 
 export const api = {
+  workflowStart: (cv: CV, use_ai: boolean) => call<{id: string; key: string}>("/api/workflows", {
+    cv, use_ai, offer: {title: cv.settings.target.title, company: cv.settings.target.company,
+    text: cv.settings.target.offer_text, url: cv.settings.target.offer_url}}),
+  workflowJob: (id: string, key: string) => call<{status: string; result?: {resource_id: string}; error?: {message: string}}>(
+    `/api/workflows/jobs/${id}`, undefined, {headers: {"X-PasseFiltre-Job-Key": key}}),
+  workflow: (id: string, key: string) => call<import("./workflow").Workflow>(`/api/workflows/${id}`, undefined,
+    {headers: {"X-PasseFiltre-Job-Key": key}}),
+  workflowSave: (id: string, key: string, version: number, cv: CV) => call<import("./workflow").Workflow>(
+    `/api/workflows/${id}/draft`, {cv}, {method: "PUT", headers: {"X-PasseFiltre-Job-Key": key, "If-Match": String(version)}}),
+  workflowApprove: (id: string, key: string, version: number, digest: string, idempotency: string) =>
+    call<{jobs: {id: string}[]}>(`/api/workflows/${id}/approve`, {version, digest, confirmed: true},
+      {headers: {"X-PasseFiltre-Job-Key": key, "Idempotency-Key": idempotency}}),
+  workflowReject: (id: string, key: string) => call(`/api/workflows/${id}/reject`, {},
+    {headers: {"X-PasseFiltre-Job-Key": key}}),
+  workflowCancel: (id: string, key: string) => call(`/api/workflows/jobs/${id}`, undefined,
+    {method: "DELETE", headers: {"X-PasseFiltre-Job-Key": key}}),
+  async workflowDownload(id: string, key: string) {
+    const response = await fetch(API + `/api/workflows/exports/${id}/download`,
+      {headers: {...authHeaders(), "X-PasseFiltre-Job-Key": key}});
+    if (!response.ok) throw new Error("Export indisponible ou validation périmée.");
+    return {blob: await response.blob(), filename: response.headers.get("Content-Disposition")?.match(/filename="(.+)"/)?.[1] ?? "CV"};
+  },
   ats: (cv: CV) => call<import("./ats").ATSAnalysis>("/api/ats", cv),
   startScrape: (b: { profile_url: string; email: string; password: string; show_browser: boolean }) =>
     call<Job>("/api/scrape", b).then(remember),

@@ -181,7 +181,7 @@ def explain_error(e: Exception) -> str:
     if isinstance(e, PublicError):
         return str(e)
     status = getattr(e, "status_code", None)
-    log.warning("LLM error (%s): %s", status, e)
+    log.warning("LLM provider failure")
     if status in (404, 405):
         return ("L'URL de l'API ne pointe pas vers une API compatible OpenAI (erreur %s). Indiquez l'adresse qui "
                 "précède /chat/completions (ex. https://api.mistral.ai/v1, ou …/api/v2 pour Paradigm)." % status)
@@ -282,12 +282,12 @@ def _inputs(cv: CV, job: str) -> dict[str, str]:
     }
 
 
-def enhance(cfg: LLMConfig, cv: CV, job_description: str, agents: list[str]) -> dict[str, Any]:
+def enhance(cfg: LLMConfig, cv: CV, job_description: str, agents: list[str], callbacks=None) -> dict[str, Any]:
     llm = make_llm(cfg)
     selected = [a for a in agents if a in AGENTS] or list(AGENTS)
     orchestrator = RunnableParallel({name: build_agent(llm, name) for name in selected})
     job = job_description.strip() or target_text(cv)
-    return orchestrator.invoke(_inputs(cv, job), config={"max_concurrency": 3})
+    return orchestrator.invoke(_inputs(cv, job), config={"max_concurrency": 3, "callbacks": callbacks or []})
 
 
 def test_connection(cfg: LLMConfig) -> str:

@@ -129,7 +129,7 @@ def start(target: Callable[[Job], Any]) -> Job:
         except PublicError as e:  # written for the user
             job.error, job.status = CANCELLED if job.cancelled() else str(e), "error"
         except Exception:
-            log.exception("Job %s failed", job.id)
+            log.error("Job %s failed", job.id)
             job.error = CANCELLED if job.cancelled() else "Erreur interne (détail dans les logs du serveur)."
             job.status = "error"
         finally:

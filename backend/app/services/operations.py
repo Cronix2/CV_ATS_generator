@@ -18,8 +18,8 @@ def offer(url):
     return tools.fetch_page_text(url)
 
 
-def enhance(llm, cv, job_description, selected):
-    return agents.enhance(llm, cv, job_description, selected)
+def enhance(llm, cv, job_description, selected, callbacks=None):
+    return agents.enhance(llm, cv, job_description, selected, callbacks=callbacks)
 
 
 def converse(llm, cv, instruction, history, hooks):

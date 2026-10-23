@@ -111,8 +111,10 @@ def pseudonym(value: str) -> str:
 
 def audit(request: HTTPConnection, action: str, **details: object) -> None:
     """One line per sensitive action. Never pass passwords, API keys or CV content here."""
-    fields = " ".join(f"{k}={v}" for k, v in details.items())
-    audit_log.info("action=%s ip=%s %s", action, client_ip(request), fields)
+    # Only bounded technical metadata; URLs, profile handles and client IPs are personal data.
+    safe = {k: v for k, v in details.items() if k in {"job", "removed", "show_browser", "origin_ok", "instruction_chars", "account"}}
+    fields = " ".join(f"{k}={v}" for k, v in safe.items())
+    audit_log.info("action=%s client_ref=%s %s", action, pseudonym(client_ip(request)), fields)
 
 
 # --------------------------------------------------------------------------- middleware
@@ -130,7 +132,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             # A JSON content type forces the CORS preflight, so "simple" cross-site POSTs are impossible.
             if method == "POST" and not request.headers.get("content-type", "").startswith("application/json"):
                 return self._deny(415, "Content-Type application/json requis.")
-            if path not in PUBLIC_PATHS and token_required(request):
+            if path not in PUBLIC_PATHS and not (os.getenv("API_V1_ENABLED") == "1" and (path == "/api/v1" or path.startswith("/api/v1/"))) and token_required(request):
                 given = request.headers.get(TOKEN_HEADER, "")
                 if not secrets.compare_digest(given.encode(), api_token().encode()):
                     audit(request, "token_refused", path=path)
