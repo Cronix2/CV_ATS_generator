@@ -237,3 +237,40 @@ def test_conversation_can_continue_and_delete_after_job_expiry(clients):
                 == 202
             )
         assert a.delete(path).status_code == 204
+
+
+def test_synchronous_render_shares_heavy_quota_and_replays_free(clients, monkeypatch):
+    monkeypatch.setenv("V1_HEAVY_PER_DAY", "1")
+    a = clients[0]
+    key = str(uuid4())
+    first = post(a, "/render", {"cv": CV}, key)
+    assert first.status_code == 200
+    replay = post(a, "/render", {"cv": CV}, key)
+    assert replay.status_code == 200 and replay.content == first.content
+    blocked = post(a, "/exports", {"cv": CV})
+    assert blocked.status_code == 429 and blocked.json()["code"] == "quota_exceeded"
+
+
+def test_synchronous_render_obeys_cross_process_capacity(clients, monkeypatch):
+    monkeypatch.setenv("V1_MAX_JOBS", "1")
+    with worker.capacity():
+        blocked = post(clients[0], "/render", {"cv": CV})
+        assert blocked.status_code == 429 and blocked.json()["code"] == "busy"
+    assert post(clients[0], "/render", {"cv": CV}).status_code == 200
+
+
+def test_failed_synchronous_provider_still_consumes_admission_quota(
+    clients, monkeypatch
+):
+    from app.v1 import business
+
+    monkeypatch.setenv("V1_HEAVY_PER_DAY", "1")
+
+    def fail(*args):
+        raise TimeoutError("provider-private-error")
+
+    monkeypatch.setattr(business, "review", fail)
+    first = post(clients[0], "/review", {"cv": CV})
+    assert first.status_code == 502 and "provider-private-error" not in first.text
+    second = post(clients[0], "/review", {"cv": CV})
+    assert second.status_code == 429 and second.json()["code"] == "quota_exceeded"

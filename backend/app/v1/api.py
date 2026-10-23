@@ -341,6 +341,18 @@ def ats(body: CVInput, actor: Actor = Depends(authenticate)):
     return analyse(body.cv)
 
 
+def charge_sync(actor):
+    # Commit admission independently: a failed provider may already have consumed resources.
+    # Called after acquiring capacity and only on an idempotency cache miss.
+    with transaction(actor) as quota:
+        store.counter(
+            quota,
+            ["heavy", actor.tenant, actor.user],
+            setting("V1_HEAVY_PER_DAY"),
+            86400,
+        )
+
+
 @app.post("/render", tags=["jct"], response_class=Response, responses=EXPORT_RESPONSE)
 def render_facade(
     body: RenderInput,
@@ -351,7 +363,11 @@ def render_facade(
     with transaction(actor) as conn:
 
         def execute():
-            result = render(body.cv, body.format)
+            from app.v1.worker import capacity
+
+            with capacity():
+                charge_sync(actor)
+                result = render(body.cv, body.format)
             store.audit(conn, actor, "render")
             return dict(
                 content=base64.b64encode(result.data).decode(),
@@ -384,16 +400,11 @@ def review_facade(
     with transaction(actor) as conn:
 
         def execute():
-            store.counter(
-                conn,
-                ["heavy", actor.tenant, actor.user],
-                setting("V1_HEAVY_PER_DAY"),
-                86400,
-            )
             # Shared cross-process admission locks also used by workers.
             from app.v1.worker import capacity
 
             with capacity():
+                charge_sync(actor)
                 try:
                     result = business.review(body.model_dump(), actor)
                 except APIError:

@@ -9,7 +9,7 @@ Aucun déploiement, aucune fusion, aucune modification de secret ou donnée de p
 | --- | --- |
 | Référence avant modifications | 146 tests backend, 2 fichiers de tests frontend et TypeScript réussis |
 | Services partagés, ATS et exports | Fixtures ATS comparées au moteur TypeScript initial ; exports déterministes entre processus |
-| Suite backend finale | **180 tests réussis**, Python 3.12, PostgreSQL 17 et Redis 7 réels, 20,50 s |
+| Suite backend finale | **183 tests réussis**, Python 3.12, PostgreSQL 17 et Redis 7 réels, 20,63 s |
 | Migration sur base vide | `0001_v1` puis `0002_maintenance` appliquées ; rôle `pf_app` non privilégié |
 | Frontend | 3 fichiers de tests réussis ; TypeScript `--noEmit` réussi |
 | Build Next.js | Construction de production réussie lors de la validation frontend ; aucun changement frontend depuis |
@@ -35,6 +35,8 @@ récupérer l'espace disque ; le code et les bases de test ont été conservés.
   JSON sans identifiants d'items, rejet d'IDs dupliqués et d'entrées mal formées.
 - Tâche Celery réelle via Redis : interruption du processus en cours, perte du contenu du
   broker, reconstruction via outbox, reprise avec tentative 2 et un seul export publié.
+- Rendu synchrone soumis à la capacité globale et au quota journalier ; lecture du résultat
+  idempotent sans nouvelle charge ; tentative de fournisseur échouée comptabilisée.
 - Annulation pendant exécution, refus de publication par un ancien lease, retries bornés,
   purge des secrets et résultats expirés, conversation réutilisable après expiration du job.
 - Workflow arrêté pour revue humaine, consentement explicite, version/digest vérifiés,
