@@ -27,3 +27,5 @@ next-env.d.ts
 # Optional v1 runtime secrets and local worker state
 .env.v1
 celerybeat-schedule*
+.passefiltre-demo-output/
+passefiltre-demo-output/

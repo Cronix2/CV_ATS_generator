@@ -166,9 +166,21 @@ scripts/passefiltre.mjs     lanceur multiplateforme (setup, start, prod, test)
 
 Les agents ont pour consigne de ne jamais inventer d'expérience, de diplôme, de chiffre ou de compétence, et de traiter le contenu web comme une donnée, jamais comme une instruction.
 
+## API REST v1 optionnelle
+
+Les intégrateurs peuvent utiliser `/api/v1` pour les profils, CV, offres, analyses ATS,
+propositions IA, exports et workflows avec validation humaine. Les routes historiques
+restent compatibles. La v1 ajoute des clés de service, l'isolation tenant/utilisateur,
+PostgreSQL et des tâches persistantes via Redis ; elle est désactivée par défaut.
+
+Consulter le [guide API et ses exemples curl/Python](docs/api-v1/README.md),
+les [instructions de migration et rollback](docs/api-v1/OPERATIONS.md),
+l'[intégration Job Control Tower](docs/api-v1/JOB_CONTROL_TOWER.md)
+et le [rapport de validation](docs/api-v1/VALIDATION.md).
+
 ## Identifiants et données
 
-- Le mot de passe LinkedIn ne sert qu'à ouvrir la session pendant l'extraction : il n'est ni stocké ni journalisé.
+- Dans le parcours historique, le mot de passe LinkedIn ne sert qu'à ouvrir la session pendant l'extraction : il n'est ni stocké ni journalisé. L'API v1 optionnelle le conserve temporairement chiffré pour permettre la reprise d'une tâche, puis l'efface (voir sa politique de rétention).
 - Les cookies de session sont conservés par compte dans `backend/.sessions/` (volume `sessions` sous Docker, ignoré par git) pour éviter une vérification LinkedIn à chaque extraction. Supprimez-les pour vous déconnecter.
 - La clé LLM saisie dans l'interface reste dans le `sessionStorage` de l'onglet ; le CV en cours est gardé dans le `localStorage` du navigateur.
 - Scraper LinkedIn, même son propre profil, est contraire à ses conditions d'utilisation et peut entraîner une restriction du compte. PasseFiltre limite le volume (une page à la fois, pauses entre sections) mais le risque n'est pas nul.

@@ -53,6 +53,10 @@ jobs:
         working-directory: backend
       - run: python scripts/export_openapi.py --check
         working-directory: backend
+      - name: Validate optional v1 Compose overlay
+        env:
+          V1_ENCRYPTION_KEY: test-compose-only-not-a-runtime-key
+        run: docker compose --env-file .env.v1.example -f docker-compose.yml -f docker-compose.v1.yml config -q
 
   frontend:
     name: Frontend (types + build)

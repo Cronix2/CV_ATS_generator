@@ -44,9 +44,27 @@ app = FastAPI(
     redoc_url=None,
     openapi_url="/openapi.json" if os.getenv("API_DOCS") == "1" else None,
     responses={
-        s: {"model": ErrorResponse} for s in (401, 403, 404, 409, 412, 422, 429, 503)
+        s: {"model": ErrorResponse}
+        for s in (401, 403, 404, 409, 412, 413, 415, 422, 428, 429, 500, 502, 503)
     },
 )
+
+EXPORT_RESPONSE = {
+    200: {
+        "description": "PDF or DOCX bytes; X-Content-SHA256 is the SHA-256 of this body.",
+        "content": {
+            mime: {"schema": {"type": "string", "format": "binary"}}
+            for mime in (
+                "application/pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+        "headers": {
+            "X-Content-SHA256": {"schema": {"type": "string"}},
+            "Content-Disposition": {"schema": {"type": "string"}},
+        },
+    }
+}
 
 
 @app.middleware("http")
@@ -323,7 +341,7 @@ def ats(body: CVInput, actor: Actor = Depends(authenticate)):
     return analyse(body.cv)
 
 
-@app.post("/render", tags=["jct"])
+@app.post("/render", tags=["jct"], response_class=Response, responses=EXPORT_RESPONSE)
 def render_facade(
     body: RenderInput,
     actor: Actor = Depends(authenticate),
@@ -425,7 +443,12 @@ def export_info(ident: UUID, actor: Actor = Depends(authenticate)):
         return row
 
 
-@app.get("/exports/{ident}/download", tags=["exports"])
+@app.get(
+    "/exports/{ident}/download",
+    tags=["exports"],
+    response_class=Response,
+    responses=EXPORT_RESPONSE,
+)
 def download(ident: UUID, actor: Actor = Depends(authenticate)):
     actor.require("exports:read")
     with transaction(actor) as conn:
@@ -646,8 +669,13 @@ def message(
         def execute():
             row = store.get(conn, "conversation", ident, lock=True)
             if row["data"]["active_job"]:
-                previous = store.get(conn, "job", row["data"]["active_job"])
-                if previous["data"]["status"] not in tasks.TERMINAL:
+                try:
+                    previous = store.get(conn, "job", row["data"]["active_job"])
+                except APIError as exc:
+                    if exc.status != 404:
+                        raise
+                    previous = None  # The conversation outlives its expiring jobs.
+                if previous and previous["data"]["status"] not in tasks.TERMINAL:
                     raise APIError(
                         409, "conversation_busy", "Un message est déjà en cours."
                     )
@@ -683,7 +711,11 @@ def conversation_delete(ident: UUID, actor: Actor = Depends(authenticate)):
     with transaction(actor) as conn:
         row = store.get(conn, "conversation", ident, lock=True)
         if row["data"]["active_job"]:
-            tasks.cancel(conn, actor, row["data"]["active_job"])
+            try:
+                tasks.cancel(conn, actor, row["data"]["active_job"])
+            except APIError as exc:
+                if exc.status != 404:
+                    raise
         store.delete(conn, "conversation", ident)
     return Response(status_code=204)
 

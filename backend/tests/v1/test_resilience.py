@@ -213,3 +213,27 @@ worker.celery.worker_main(['worker','--pool=solo','--concurrency=1','--loglevel=
             proc.wait(timeout=5)
         log.close()
         redis.flushdb()
+
+
+def test_conversation_can_continue_and_delete_after_job_expiry(clients):
+    a = clients[0]
+    for continue_first in (True, False):
+        conversation = post(a, "/conversations", {"cv": CV}).json()
+        path = "/conversations/" + conversation["id"]
+        job = post(
+            a, path + "/messages", {"instruction": "Review the existing facts"}
+        ).json()
+        with transaction(a.actor) as conn:
+            sql(
+                conn,
+                "UPDATE pf_records SET expires_at=now()-interval '1 second' WHERE id=:id",
+                id=job["id"],
+            )
+        if continue_first:
+            assert (
+                post(
+                    a, path + "/messages", {"instruction": "Continue reviewing"}
+                ).status_code
+                == 202
+            )
+        assert a.delete(path).status_code == 204
