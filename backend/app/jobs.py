@@ -115,6 +115,18 @@ def start(target: Callable[[Job], Any]) -> Job:
     slots = _slots  # release exactly the semaphore we acquired
     if not slots.acquire(blocking=False):
         raise Busy("Trop de tâches en cours (extraction ou agent IA) : réessayez dans un instant.")
+    shared_capacity = None
+    if os.getenv("API_V1_ENABLED") == "1":
+        from app.v1.worker import capacity
+        from app.v1.errors import APIError
+        try:
+            shared_capacity = capacity()
+            shared_capacity.__enter__()
+        except Exception as exc:
+            slots.release()
+            if isinstance(exc, APIError) and exc.code == "busy":
+                raise Busy("Trop de tâches en cours : réessayez dans un instant.") from None
+            raise
     for jid in [j for j, job in _jobs.items() if time.time() - job.created > JOB_TTL]:
         _jobs.pop(jid, None)
     job = Job()
@@ -133,6 +145,8 @@ def start(target: Callable[[Job], Any]) -> Job:
             job.error = CANCELLED if job.cancelled() else "Erreur interne (détail dans les logs du serveur)."
             job.status = "error"
         finally:
+            if shared_capacity is not None:
+                shared_capacity.__exit__(None, None, None)
             slots.release()
 
     threading.Thread(target=run, daemon=True).start()

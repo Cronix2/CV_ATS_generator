@@ -1,0 +1,169 @@
+# Opt-in overlay: docker compose --env-file .env --env-file .env.v1 -f docker-compose.yml -f docker-compose.v1.yml ...
+# The normal deployment workflow never loads this overlay.
+x-v1-environment: &v1-environment
+  V1_DATABASE_URL: ${V1_DATABASE_URL:?Set V1_DATABASE_URL in .env.v1}
+  V1_REDIS_URL: ${V1_REDIS_URL:?Set V1_REDIS_URL in .env.v1}
+  V1_ENCRYPTION_KEY: ${V1_ENCRYPTION_KEY:?Set V1_ENCRYPTION_KEY in .env.v1}
+  V1_MAX_JOBS: ${V1_MAX_JOBS:-2}
+  V1_RATE_SERVICE_PER_MINUTE: ${V1_RATE_SERVICE_PER_MINUTE:-120}
+  V1_RATE_USER_PER_MINUTE: ${V1_RATE_USER_PER_MINUTE:-60}
+  V1_HEAVY_PER_DAY: ${V1_HEAVY_PER_DAY:-20}
+  V1_RESULT_TTL_SECONDS: ${V1_RESULT_TTL_SECONDS:-86400}
+  V1_SECRET_TTL_SECONDS: ${V1_SECRET_TTL_SECONDS:-1800}
+  V1_SESSION_TTL_SECONDS: ${V1_SESSION_TTL_SECONDS:-2592000}
+  V1_REVIEW_TTL_SECONDS: ${V1_REVIEW_TTL_SECONDS:-604800}
+  V1_LLM_PROVIDERS: ${V1_LLM_PROVIDERS:-{}}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_BASE_URL: ${LLM_BASE_URL:-}
+  LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+  CAPTCHA_BROWSER_URL: http://captcha-browser:9300
+  INTERACTIVE_CAPTCHA: ${INTERACTIVE_CAPTCHA:-1}
+  CAPTCHA_TIMEOUT: ${CAPTCHA_TIMEOUT:-300}
+
+services:
+  api:
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:-latest}
+    environment:
+      <<: *v1-environment
+      API_V1_ENABLED: '1'
+      V1_UI_SERVICE_KEY: ${V1_UI_SERVICE_KEY:-}
+    networks: [default, captcha, v1-data]
+    depends_on:
+      v1-postgres:
+        condition: service_healthy
+      v1-redis:
+        condition: service_healthy
+
+  captcha-browser:
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:-latest}
+
+  captcha-egress:
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:-latest}
+
+  web:
+    image: ghcr.io/cronix2/passefiltre-web:${PASSEFILTRE_IMAGE_TAG:-latest}
+
+  v1-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: passefiltre
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${V1_POSTGRES_PASSWORD:?Set V1_POSTGRES_PASSWORD}
+      V1_APP_DB_PASSWORD: ${V1_APP_DB_PASSWORD:?Set V1_APP_DB_PASSWORD}
+    volumes:
+      - v1-postgres:/var/lib/postgresql/data
+      - ./deploy/init-v1-db.sh:/docker-entrypoint-initdb.d/10-passefiltre.sh:ro
+    networks: [v1-data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U postgres -d passefiltre']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: ${V1_DB_MEM_LIMIT:-512m}
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  v1-redis:
+    image: redis:7-alpine
+    environment:
+      V1_REDIS_PASSWORD: ${V1_REDIS_PASSWORD:?Set V1_REDIS_PASSWORD}
+    command: [sh, -c, 'exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$V1_REDIS_PASSWORD"']
+    volumes:
+      - v1-redis:/data
+    networks: [v1-data]
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$V1_REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 256m
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  v1-migrate:
+    profiles: [v1-tools]
+    build: ./backend
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:-latest}
+    command: [python, -m, alembic, upgrade, head]
+    environment:
+      V1_MIGRATION_DATABASE_URL: ${V1_MIGRATION_DATABASE_URL:?Set V1_MIGRATION_DATABASE_URL}
+    networks: [v1-data]
+    depends_on:
+      v1-postgres:
+        condition: service_healthy
+    security_opt: [no-new-privileges:true]
+
+  v1-worker:
+    build: ./backend
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:-latest}
+    command: [celery, -A, app.v1.worker:celery, worker, -Q, default, --concurrency=1, --loglevel=WARNING]
+    environment: *v1-environment
+    networks: [default, v1-data]
+    depends_on:
+      v1-postgres:
+        condition: service_healthy
+      v1-redis:
+        condition: service_healthy
+    init: true
+    mem_limit: ${V1_WORKER_MEM_LIMIT:-768m}
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -m, app.v1.runtime_check]
+      interval: 30s
+      timeout: 5s
+
+  v1-browser-worker:
+    build: ./backend
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:-latest}
+    command: [celery, -A, app.v1.worker:celery, worker, -Q, browser, --concurrency=1, --loglevel=WARNING]
+    environment:
+      <<: *v1-environment
+      V1_BROWSER_TMP: /tmp
+    networks: [default, captcha, v1-data]
+    volumes:
+      - captcha-run:/run/pf-captcha
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=1777
+    shm_size: 1gb
+    init: true
+    pids_limit: 512
+    mem_limit: ${V1_BROWSER_MEM_LIMIT:-2g}
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      v1-postgres:
+        condition: service_healthy
+      v1-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -m, app.v1.runtime_check]
+      interval: 30s
+      timeout: 5s
+
+  v1-scheduler:
+    build: ./backend
+    image: ghcr.io/cronix2/passefiltre-api:${PASSEFILTRE_IMAGE_TAG:-latest}
+    command: [python, -m, app.v1.scheduler]
+    environment: *v1-environment
+    networks: [v1-data]
+    tmpfs: [/tmp]
+    mem_limit: 192m
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    depends_on:
+      v1-postgres:
+        condition: service_healthy
+      v1-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+
+volumes:
+  v1-postgres:
+  v1-redis:
+networks:
+  v1-data:
+    internal: true

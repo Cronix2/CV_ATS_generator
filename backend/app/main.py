@@ -285,6 +285,8 @@ if os.getenv("API_V1_ENABLED") == "1":
     def validate_v1_config():
         from app.v1.db import check
         from app.v1.crypto import key
+        from app.v1.settings import validate
+        validate()
         key()
         if not os.getenv("V1_REDIS_URL"):
             raise RuntimeError("V1_REDIS_URL required")

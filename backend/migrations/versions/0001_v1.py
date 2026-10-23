@@ -1,11 +1,14 @@
 """Additive v1 schema; no legacy data is imported or modified."""
+
 from alembic import op
-revision = '0001_v1'
+
+revision = "0001_v1"
 down_revision = None
 
 
 def upgrade():
-    op.execute('''
+    op.execute("""
+    GRANT USAGE ON SCHEMA public TO pf_app;
     CREATE TABLE pf_keys (
       id uuid PRIMARY KEY, tenant text NOT NULL, service text NOT NULL,
       digest text UNIQUE NOT NULL, scopes jsonb NOT NULL,
@@ -43,16 +46,18 @@ def upgrade():
     GRANT SELECT, INSERT, UPDATE, DELETE ON pf_records, pf_outbox, pf_counters TO pf_app;
     GRANT INSERT ON pf_audit TO pf_app;
     GRANT USAGE ON SEQUENCE pf_audit_id_seq TO pf_app;
-    ''')
+    """)
     # A dedicated maintenance function exposes only tenant contexts, never document content.
-    op.execute('''CREATE FUNCTION pf_expired_owners() RETURNS TABLE(tenant text, owner_id text)
+    op.execute("""CREATE FUNCTION pf_expired_owners() RETURNS TABLE(tenant text, owner_id text)
       LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,public AS $$
         SELECT DISTINCT r.tenant,r.owner_id FROM public.pf_records r WHERE r.expires_at <= now()
       $$;
       REVOKE ALL ON FUNCTION pf_expired_owners() FROM PUBLIC;
       GRANT EXECUTE ON FUNCTION pf_expired_owners() TO pf_app;
-    ''')
+    """)
 
 
 def downgrade():
-    raise RuntimeError('Destructive downgrade disabled: roll back the application and retain v1 volumes.')
+    raise RuntimeError(
+        "Destructive downgrade disabled: roll back the application and retain v1 volumes."
+    )
