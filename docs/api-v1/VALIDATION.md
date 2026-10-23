@@ -12,7 +12,7 @@ Aucun déploiement, aucune fusion, aucune modification de secret ou donnée de p
 | Suite backend finale | **183 tests réussis**, Python 3.12, PostgreSQL 17 et Redis 7 réels, 20,63 s |
 | Migration sur base vide | `0001_v1` puis `0002_maintenance` appliquées ; rôle `pf_app` non privilégié |
 | Frontend | 3 fichiers de tests réussis ; TypeScript `--noEmit` réussi |
-| Build Next.js | Construction de production réussie lors de la validation frontend ; aucun changement frontend depuis |
+| Build Next.js | Build Webpack local réussi après mise à jour des dépendances ; le build Turbopack normal est vérifié par la CI |
 | OpenAPI | Artefact généré puis vérifié par `export_openapi.py --check` |
 | Exemple Python de bout en bout | Réussi contre Uvicorn, PostgreSQL, Redis, Celery et scheduler réels ; PDF et DOCX produits après approbation d'un CV fictif |
 | Compose v1 | `docker compose ... config -q` réussi avec valeurs fictives |
