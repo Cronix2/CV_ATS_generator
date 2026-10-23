@@ -179,7 +179,7 @@ def normalize_base_url(url: str) -> str | None:
 
 def explain_error(e: Exception) -> str:
     """User-facing message. Never echoes the remote response body (it could come from an internal service);
-    the full error goes to the server logs."""
+    server logs record only a static provider-failure event."""
     if isinstance(e, PublicError):
         return str(e)
     status = getattr(e, "status_code", None)

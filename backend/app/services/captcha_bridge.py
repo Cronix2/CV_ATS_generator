@@ -66,4 +66,3 @@ async def bridge(ws: WebSocket, job):
                 with contextlib.suppress(WebSocketDisconnect):  # the browser is already gone
                     await ws.close()
         audit(ws, "captcha_vnc_close", job=job.id)
-
