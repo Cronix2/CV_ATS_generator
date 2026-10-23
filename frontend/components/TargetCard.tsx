@@ -17,7 +17,7 @@ export function TargetCard() {
   const [error, setError] = useState("");
   const [draft, setDraft] = useState("");
   const ats = useATS(cv);
-  const match = ats.data ?? { keywords: t.keywords, found: [], missing: [], percent: null };
+  const match = ats.data ?? { keywords: t.keywords, found: [] as string[], missing: [] as string[], percent: null };
 
   const set = (patch: Partial<Target>) =>
     update((c) => ({ ...c, settings: { ...c.settings, target: { ...c.settings.target, ...patch } } }));
