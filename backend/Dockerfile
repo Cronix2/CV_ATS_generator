@@ -1,6 +1,6 @@
 # PasseFiltre API: FastAPI + Scrapling (headless Chromium) + LangChain. The same image runs the isolated
 # CAPTCHA browser (headful, virtual screen) and its egress proxy as separate services (docker-compose.yml).
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
